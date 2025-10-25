@@ -1,0 +1,17 @@
+pydantic
+numpy
+ollama
+anthropic[bedrock]
+openai
+gemini-ai
+sentence-transformers
+transformers
+torch
+torchvision
+torchaudio
+llama-cpp-python
+Pillow
+python-dotenv
+pytest
+boto3
+setuptools
