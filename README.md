@@ -333,27 +333,55 @@ model = LLMModelFactory.create_model(
 
 ## Architecture
 
-LLMFactory uses an abstract factory pattern:
+### Modular Provider Design (v0.2.0+)
 
+LLMFactory features a clean, modular architecture with providers organized in dedicated modules:
+
+```
+LLMFactory/
+├── llm.py                    # Factory and main exports
+└── providers/
+    ├── base.py              # InferenceModel ABC + utilities
+    ├── ollama.py            # Ollama providers
+    ├── lmstudio.py          # LM Studio provider
+    ├── anthropic.py         # Anthropic providers
+    ├── openai.py            # OpenAI providers
+    ├── gemini.py            # Google Gemini provider
+    ├── embeddings.py        # Sentence Transformers
+    └── llamacpp.py          # llama.cpp provider
+```
+
+**Class Hierarchy:**
 ```
 InferenceModel (ABC)
 ├── OllamaInference
+├── LMStudioInference
 ├── AnthropicInference
 ├── AnthropicBedrockInference
 ├── OpenAIInference
+├── CustomOAIInference
 ├── GeminiInference
 ├── LlamacppInference
-├── CustomOAIInference
 ├── SentenceTransformerInference
 └── OllamaEmbedInference
 
 LLMModelFactory.create_model() -> InferenceModel
 ```
 
-All models implement:
+**All models implement:**
 - `invoke()` - Generate text/embeddings
 - `_load_model()` - Initialize the provider client
 - `_get_provider()` - Return provider name
+
+**Import Flexibility:**
+```python
+# Import from main module (recommended for compatibility)
+from LLMFactory.llm import OllamaInference, LLMModelFactory
+
+# Import from specific provider module
+from LLMFactory.providers.ollama import OllamaInference
+from LLMFactory.providers import AnthropicInference
+```
 
 ## Development
 
@@ -386,6 +414,49 @@ flake8 LLMFactory/
 mypy LLMFactory/
 ```
 
+### Adding a New Provider
+
+LLMFactory's modular architecture makes it easy to add new providers:
+
+1. **Create provider module**: `LLMFactory/providers/your_provider.py`
+   ```python
+   from .base import InferenceModel
+
+   class YourProviderInference(InferenceModel):
+       def _get_provider(self) -> str:
+           return "your-provider"
+
+       def _load_model(self):
+           # Initialize your provider's client
+           pass
+
+       def invoke(self, messages, system_prompt, **kwargs):
+           # Implement inference logic
+           pass
+   ```
+
+2. **Export provider**: Add to `LLMFactory/providers/__init__.py`
+   ```python
+   from .your_provider import YourProviderInference
+
+   __all__ = [..., 'YourProviderInference']
+   ```
+
+3. **Register in factory**: Update `LLMFactory/llm.py`
+   ```python
+   from .providers import (..., YourProviderInference)
+
+   class LLMModelFactory:
+       _models = {
+           ...,
+           'your-provider': YourProviderInference
+       }
+   ```
+
+4. **Add tests**: Create `tests/test_your_provider.py`
+
+See [RELEASE.md](RELEASE.md) for more details on the modular architecture.
+
 ## Contributing
 
 Contributions are welcome! Please feel free to submit a Pull Request.
@@ -395,6 +466,14 @@ Contributions are welcome! Please feel free to submit a Pull Request.
 3. Commit your changes (`git commit -m 'Add some AmazingFeature'`)
 4. Push to the branch (`git push origin feature/AmazingFeature`)
 5. Open a Pull Request
+
+### Contribution Guidelines
+
+- Follow the existing code style and structure
+- Add tests for new features
+- Update documentation as needed
+- Ensure all tests pass before submitting PR
+- Keep commits focused and atomic
 
 ## License
 
@@ -411,6 +490,21 @@ This project is licensed under the Apache License 2.0 - see the [LICENSE](LICENS
 - Documentation: [https://github.com/M-Chimiste/LLMFactory](https://github.com/M-Chimiste/LLMFactory)
 
 ## Changelog
+
+### v0.2.0 (Modular Provider Architecture)
+- **🏗️ Major Refactoring**: Reorganized codebase into modular provider architecture
+- **📦 Improved Maintainability**: Each provider now in dedicated module under `LLMFactory/providers/`
+- **✅ 100% Backward Compatible**: All existing imports continue to work
+- **🚀 Developer Experience**: Simplified process for adding new providers
+- **📊 Code Reduction**: Main `llm.py` reduced from 1,269 to 109 lines (91% reduction)
+- **✨ Import Flexibility**: Can import from main module or specific provider modules
+- **🔧 Better Organization**: Clear separation of concerns with `base.py`, provider-specific modules
+- See [RELEASE.md](RELEASE.md) for detailed migration guide and architecture overview
+
+### v0.1.0 (LM Studio Support)
+- Added LM Studio provider with remote connection support
+- Enhanced multimodal capabilities
+- Improved test coverage
 
 ### v0.0.1 (Initial Release)
 - Unified interface for 8 LLM providers
