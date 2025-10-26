@@ -2,7 +2,7 @@
 
 from .llm import LLMModelFactory
 
-__version__ = "0.0.1"
+__version__ = "0.0.3"
 __author__ = "M Chimiste"
 __license__ = "Apache-2.0"
 
