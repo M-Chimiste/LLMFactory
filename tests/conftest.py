@@ -14,6 +14,7 @@ def mock_env_vars(monkeypatch):
     monkeypatch.setenv("OPENAI_API_KEY", "test-openai-key")
     monkeypatch.setenv("GOOGLE_API_KEY", "test-google-key")
     monkeypatch.setenv("OLLAMA_URL", "http://localhost:11434")
+    monkeypatch.setenv("LMSTUDIO_HOST", "localhost:1234")
     monkeypatch.setenv("CUSTOM_OAI_BASE_URL", "http://localhost:8000")
     monkeypatch.setenv("CUSTOM_OAI_API_KEY", "test-custom-key")
 
@@ -104,4 +105,18 @@ def mock_llama_client():
     mock.create_chat_completion.return_value = {
         'choices': [{'message': {'content': 'Test response'}}]
     }
+    return mock
+
+
+@pytest.fixture
+def mock_lmstudio_client():
+    """Mock LM Studio client."""
+    mock = Mock()
+    mock_model = Mock()
+    mock_response = Mock()
+    mock_response.content = "Test response"
+    mock_model.respond.return_value = mock_response
+    mock.llm.return_value = mock_model
+    mock.Chat.return_value = Mock()
+    mock.Client.is_valid_api_host.return_value = True
     return mock
