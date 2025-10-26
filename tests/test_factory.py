@@ -2,7 +2,7 @@
 import pytest
 from LLMFactory import LLMModelFactory
 from LLMFactory.llm import (
-    OllamaInference, AnthropicInference, OpenAIInference,
+    OllamaInference, LMStudioInference, AnthropicInference, OpenAIInference,
     GeminiInference, CustomOAIInference, SentenceTransformerInference,
     OllamaEmbedInference, LlamacppInference
 )
@@ -13,6 +13,25 @@ def test_factory_create_ollama():
     model = LLMModelFactory.create_model('ollama', model_name='test-model')
     assert isinstance(model, OllamaInference)
     assert model.model_name == 'test-model'
+
+
+def test_factory_create_lmstudio(mock_env_vars):
+    """Test creating LMStudio model."""
+    # Mock lmstudio module
+    import sys
+    from unittest.mock import Mock
+    mock_lms = Mock()
+    mock_lms.Client.is_valid_api_host.return_value = True
+    sys.modules['lmstudio'] = mock_lms
+
+    try:
+        model = LLMModelFactory.create_model('lmstudio', model_name='qwen2.5-7b-instruct')
+        assert isinstance(model, LMStudioInference)
+        assert model.model_name == 'qwen2.5-7b-instruct'
+    finally:
+        # Cleanup
+        if 'lmstudio' in sys.modules:
+            del sys.modules['lmstudio']
 
 
 def test_factory_create_anthropic(mock_env_vars, monkeypatch):
