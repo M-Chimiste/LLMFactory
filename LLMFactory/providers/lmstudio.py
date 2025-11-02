@@ -169,13 +169,9 @@ class LMStudioInference(InferenceModel):
         # Get or load the model
         model = self._get_or_load_model()
 
-        # Create Chat object for LM Studio SDK
-        chat = self.client.Chat()
-
-        # Add system prompt
-        if system_prompt:
-            chat.add_system_message(system_prompt)
-
+        # Create Chat object with system prompt as constructor argument
+        chat = self.client.Chat(system_prompt)
+        
         # Process messages and handle images
         image_handles = None
         if images:
@@ -200,7 +196,8 @@ class LMStudioInference(InferenceModel):
             is_last_user_msg = (i == len(messages) - 1 and role == "user")
 
             if role == "system":
-                chat.add_system_message(content)
+                # Skip system messages as they're handled in Chat constructor
+                continue
             elif role == "assistant":
                 chat.add_assistant_message(content)
             else:  # user or any other role
