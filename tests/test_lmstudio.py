@@ -194,6 +194,9 @@ def test_lmstudio_invoke_with_schema(setup_lmstudio_mock, sample_messages, sampl
     mock_model = Mock()
     mock_response = Mock()
     mock_response.content = '{"name": "John", "age": 30}'
+    # Add parsed attribute for structured output
+    mock_parsed = TestSchema(name="John", age=30)
+    mock_response.parsed = mock_parsed
     mock_model.respond.return_value = mock_response
     setup_lmstudio_mock.llm.return_value = mock_model
     mock_chat = Mock()
@@ -202,10 +205,16 @@ def test_lmstudio_invoke_with_schema(setup_lmstudio_mock, sample_messages, sampl
     model = LMStudioInference(model_name="test-model")
     response = model.invoke(sample_messages, sample_system_prompt, schema=TestSchema)
 
-    assert '{"name": "John", "age": 30}' in response
+    # When schema is provided, should return the parsed object
+    assert response == mock_parsed
+    assert response.name == "John"
+    assert response.age == 30
+    
     call_args = mock_model.respond.call_args
-    assert 'response_format' in call_args[1]
-    assert call_args[1]['response_format'] == TestSchema
+    # response_format is inside the config dict
+    assert 'config' in call_args[1]
+    assert 'response_format' in call_args[1]['config']
+    assert call_args[1]['config']['response_format'] == TestSchema
 
 
 def test_lmstudio_invoke_with_custom_params(setup_lmstudio_mock, sample_messages, sample_system_prompt):

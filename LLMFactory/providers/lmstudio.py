@@ -244,12 +244,26 @@ class LMStudioInference(InferenceModel):
                                 yield chunk['content']
                         elif isinstance(chunk, str) and chunk:
                             yield chunk
+                    
+                    # For structured output with streaming, get final parsed result
+                    if schema:
+                        try:
+                            final_result = stream.result()
+                            if hasattr(final_result, 'parsed'):
+                                # Store parsed result for access after iteration
+                                _gen.parsed_result = final_result.parsed
+                        except Exception:
+                            pass
 
                 return _gen()
             else:
                 # Return full response
                 response = model.respond(chat, config=config)
 
+                # For structured output, return parsed result
+                if schema and hasattr(response, 'parsed'):
+                    return response.parsed
+                
                 # Handle different possible response formats
                 if hasattr(response, 'content'):
                     return response.content
