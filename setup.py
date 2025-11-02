@@ -9,7 +9,7 @@ with open("requirements.txt", "r", encoding="utf-8") as fh:
 
 setup(
     name="LLMFactory",
-    version="0.2.1",
+    version="0.2.2",
     author="M Chimiste",
     author_email="",
     description="A unified factory pattern interface for multiple LLM inference providers with multimodal support",

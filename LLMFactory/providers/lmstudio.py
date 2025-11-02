@@ -95,13 +95,16 @@ class LMStudioInference(InferenceModel):
             return self._model_instance
 
         # Build load configuration
+        # Note: LM Studio SDK uses camelCase parameter names
         config = {}
         if self.context_length is not None:
-            config["context_length"] = self.context_length
+            config["contextLength"] = self.context_length
         if self.gpu_offload is not None:
             if isinstance(self.gpu_offload, str):
-                config["gpu_offload"] = self.gpu_offload  # "max" or "off"
+                # For string values like "max" or "off", use gpuOffload
+                config["gpuOffload"] = self.gpu_offload
             else:
+                # For numeric ratio (0-1), use gpu.ratio structure
                 config["gpu"] = {"ratio": self.gpu_offload}
 
         # Load model with configuration (JIT loading)
@@ -206,25 +209,30 @@ class LMStudioInference(InferenceModel):
                 else:
                     chat.add_user_message(content)
 
-        # Build generation parameters
-        gen_params = {
-            "max_tokens": kwargs.get("max_tokens", self.max_new_tokens),
+        # Build generation config
+        # Note: LM Studio SDK uses a 'config' dict with camelCase parameter names
+        config = {
             "temperature": kwargs.get("temperature", self.temperature),
+            "maxTokens": kwargs.get("max_tokens", self.max_new_tokens),
         }
-
+        
         # Add structured output support if schema provided
         if schema:
-            gen_params["response_format"] = schema
+            config["response_format"] = schema
 
         # Add additional sampling parameters if provided
-        for key in ["top_p", "top_k", "stop"]:
-            if key in kwargs:
-                gen_params[key] = kwargs[key]
+        # Map snake_case to camelCase for LM Studio SDK
+        if "top_p" in kwargs:
+            config["topP"] = kwargs["top_p"]
+        if "top_k" in kwargs:
+            config["topK"] = kwargs["top_k"]
+        if "stop" in kwargs:
+            config["stop"] = kwargs["stop"]
 
         try:
             if streaming:
                 # Return streaming iterator
-                stream = model.respond_stream(chat, **gen_params)
+                stream = model.respond_stream(chat, config=config)
 
                 def _gen() -> Iterator[str]:
                     for chunk in stream:
@@ -240,7 +248,7 @@ class LMStudioInference(InferenceModel):
                 return _gen()
             else:
                 # Return full response
-                response = model.respond(chat, **gen_params)
+                response = model.respond(chat, config=config)
 
                 # Handle different possible response formats
                 if hasattr(response, 'content'):

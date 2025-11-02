@@ -96,7 +96,8 @@ def test_lmstudio_invoke_basic(setup_lmstudio_mock, sample_messages, sample_syst
     response = model.invoke(sample_messages, sample_system_prompt)
 
     assert response == "Test response"
-    mock_chat.add_system_message.assert_called_with(sample_system_prompt)
+    # Check that Chat was initialized with the system prompt
+    setup_lmstudio_mock.Chat.assert_called_with(sample_system_prompt)
     assert mock_chat.add_user_message.call_count == 2
     assert mock_chat.add_assistant_message.call_count == 1
     mock_model.respond.assert_called_once()
@@ -230,10 +231,13 @@ def test_lmstudio_invoke_with_custom_params(setup_lmstudio_mock, sample_messages
 
     assert response == "Test response"
     call_args = mock_model.respond.call_args[1]
-    assert call_args['max_tokens'] == 1024
-    assert call_args['temperature'] == 0.9
-    assert call_args['top_p'] == 0.95
-    assert call_args['top_k'] == 50
+    # LM Studio SDK uses a 'config' dict with camelCase parameters
+    assert 'config' in call_args
+    config = call_args['config']
+    assert config['temperature'] == 0.9
+    assert config['maxTokens'] == 1024
+    assert config['topP'] == 0.95
+    assert config['topK'] == 50
 
 
 def test_lmstudio_invoke_response_dict_format(setup_lmstudio_mock, sample_messages, sample_system_prompt):
@@ -282,8 +286,9 @@ def test_lmstudio_get_or_load_model_with_config(setup_lmstudio_mock):
     call_args = setup_lmstudio_mock.llm.call_args
     assert call_args[0][0] == "test-model"
     assert 'config' in call_args[1]
-    assert call_args[1]['config']['context_length'] == 32768
-    assert call_args[1]['config']['gpu_offload'] == "max"
+    # LM Studio SDK uses camelCase parameter names
+    assert call_args[1]['config']['contextLength'] == 32768
+    assert call_args[1]['config']['gpuOffload'] == "max"
 
 
 def test_lmstudio_get_or_load_model_with_gpu_ratio(setup_lmstudio_mock):
