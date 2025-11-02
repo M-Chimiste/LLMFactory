@@ -18,6 +18,7 @@ A unified factory pattern interface for multiple LLM inference providers with mu
 
 ### Chat/Completion Models
 - **Ollama** - Local model inference
+- **LM Studio** - Local/remote inference with advanced configuration (GPU offload, large context)
 - **Anthropic** - Claude models via API
 - **Anthropic Bedrock** - Claude models via AWS Bedrock
 - **OpenAI** - GPT models
@@ -214,6 +215,129 @@ model = LLMModelFactory.create_model(
 )
 ```
 
+### LM Studio
+
+LM Studio provides a desktop app and local server for running LLMs. The `lmstudio` provider supports both local and remote connections with advanced configuration.
+
+#### Basic Local Usage
+
+```python
+# Local connection (default: localhost:1234)
+model = LLMModelFactory.create_model(
+    model_type='lmstudio',
+    model_name='qwen2.5-7b-instruct',
+    temperature=0.7
+)
+
+response = model.invoke(
+    messages=[{"role": "user", "content": "Hello!"}],
+    system_prompt="You are a helpful assistant."
+)
+```
+
+#### Remote Connection
+
+```python
+# Connect to remote LM Studio instance
+model = LLMModelFactory.create_model(
+    model_type='lmstudio',
+    model_name='llama-3.1-8b',
+    host='athena.local:1234',  # or use IP: '192.168.1.100:1234'
+    temperature=0.7
+)
+
+# Or use environment variable
+# export LMSTUDIO_HOST=athena.local:1234
+```
+
+#### Advanced Configuration
+
+```python
+# Full GPU offload with large context window
+model = LLMModelFactory.create_model(
+    model_type='lmstudio',
+    model_name='qwen2.5-7b-instruct',
+    context_length=32768,      # Set context window size
+    gpu_offload='max',          # Options: 'max', 'off', or float 0-1
+    temperature=0.8
+)
+
+# Partial GPU offload (50% of layers on GPU)
+model = LLMModelFactory.create_model(
+    model_type='lmstudio',
+    model_name='mistral-7b',
+    context_length=16384,
+    gpu_offload=0.5,            # 50% of layers on GPU
+    max_new_tokens=2048
+)
+```
+
+#### Structured Output with Schema
+
+```python
+from pydantic import BaseModel
+
+class BookInfo(BaseModel):
+    title: str
+    author: str
+    year: int
+
+model = LLMModelFactory.create_model(
+    model_type='lmstudio',
+    model_name='qwen2.5-7b-instruct'
+)
+
+# Non-streaming structured output
+book = model.invoke(
+    messages=[{"role": "user", "content": "Tell me about The Hobbit"}],
+    system_prompt="Extract book information.",
+    schema=BookInfo
+)
+
+print(f"Title: {book.title}, Author: {book.author}, Year: {book.year}")
+
+# Streaming with structured output
+response_stream = model.invoke(
+    messages=[{"role": "user", "content": "Tell me about 1984"}],
+    system_prompt="Extract book information.",
+    schema=BookInfo,
+    streaming=True
+)
+
+# Stream tokens as they arrive
+for chunk in response_stream:
+    print(chunk, end='', flush=True)
+```
+
+#### Vision Models (Multimodal)
+
+```python
+# Use LM Studio with vision-capable models
+model = LLMModelFactory.create_model(
+    model_type='lmstudio',
+    model_name='llava-1.5-7b'
+)
+
+response = model.invoke(
+    messages=[{"role": "user", "content": "What's in this image?"}],
+    system_prompt="You are a vision assistant.",
+    images=["photo.jpg"]  # Supports file paths or bytes
+)
+```
+
+#### Sampling Parameters
+
+```python
+response = model.invoke(
+    messages=[{"role": "user", "content": "Write a creative story"}],
+    system_prompt="You are a creative writer.",
+    max_tokens=1024,
+    temperature=0.9,
+    top_p=0.95,
+    top_k=50
+)
+```
+
 ### Custom OpenAI-Compatible API
 
 ```python
@@ -269,6 +393,9 @@ export GOOGLE_API_KEY=your-key
 
 # Ollama
 export OLLAMA_URL=http://localhost:11434
+
+# LM Studio
+export LMSTUDIO_HOST=localhost:1234  # or remote: athena.local:1234
 
 # AWS Bedrock
 export AWS_PROFILE=your-profile
@@ -481,7 +608,7 @@ This project is licensed under the Apache License 2.0 - see the [LICENSE](LICENS
 
 ## Acknowledgments
 
-- Built on top of excellent provider SDKs: anthropic, openai, google-generativeai, ollama, llama-cpp-python
+- Built on top of excellent provider SDKs: anthropic, openai, google-generativeai, ollama, lmstudio-python, llama-cpp-python
 - Inspired by the need for a unified LLM interface
 
 ## Support
