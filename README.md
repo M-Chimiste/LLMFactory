@@ -219,6 +219,8 @@ model = LLMModelFactory.create_model(
 
 LM Studio provides a desktop app and local server for running LLMs. The `lmstudio` provider supports both local and remote connections with advanced configuration.
 
+> **Note**: The LMStudio SDK uses a singleton pattern for its default client. LLMFactory handles this **automatically and transparently** - you can create multiple model instances without any special handling. Just use `LLMModelFactory.create_model()` as you would with any other provider.
+
 #### Basic Local Usage
 
 ```python
@@ -617,6 +619,12 @@ This project is licensed under the Apache License 2.0 - see the [LICENSE](LICENS
 - Documentation: [https://github.com/M-Chimiste/LLMFactory](https://github.com/M-Chimiste/LLMFactory)
 
 ## Changelog
+
+### v0.2.1 (LM Studio Singleton Handling)
+- **🔧 LMStudio Fix**: Resolved `LMStudioClientError: Default client is already created` error
+- **♻️ Transparent Caching**: Multiple LMStudio instances now work seamlessly without any API changes
+- **🔒 Thread Safety**: Added thread-safe instance caching for concurrent usage
+- **⚠️ Host Warning**: Clear warning when attempting to use different hosts (SDK limitation)
 
 ### v0.2.0 (Modular Provider Architecture)
 - **🏗️ Major Refactoring**: Reorganized codebase into modular provider architecture

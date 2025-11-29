@@ -449,23 +449,18 @@ def test_lmstudio_invalid_image_type(setup_lmstudio_mock, sample_messages, sampl
 # Singleton Pattern Handling Tests
 # =============================================================================
 
-@pytest.fixture
+@pytest.fixture(autouse=True)
 def reset_lmstudio_state():
-    """Reset all LMStudio singleton state before and after tests."""
-    # Store original state
-    original_host = lmstudio_module._lmstudio_configured_host
-    original_cache = llm_module._lmstudio_cache.copy()
-    
+    """Reset all LMStudio singleton state before and after each test."""
     # Reset state before test
     lmstudio_module._lmstudio_configured_host = None
     llm_module._lmstudio_cache.clear()
     
     yield
     
-    # Restore original state after test
-    lmstudio_module._lmstudio_configured_host = original_host
+    # Reset state after test to ensure clean state for next test
+    lmstudio_module._lmstudio_configured_host = None
     llm_module._lmstudio_cache.clear()
-    llm_module._lmstudio_cache.update(original_cache)
 
 
 def test_lmstudio_multiple_instances_same_host(setup_lmstudio_mock, reset_lmstudio_state):
