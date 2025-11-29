@@ -1,8 +1,11 @@
 """Tests for LMStudioInference."""
 import pytest
 import sys
+import threading
 from unittest.mock import Mock, patch
-from LLMFactory.llm import LMStudioInference
+from LLMFactory.llm import LMStudioInference, LLMModelFactory
+from LLMFactory.providers import lmstudio as lmstudio_module
+from LLMFactory import llm as llm_module
 
 
 @pytest.fixture(autouse=True)
@@ -440,3 +443,239 @@ def test_lmstudio_invalid_image_type(setup_lmstudio_mock, sample_messages, sampl
             sample_system_prompt,
             images=[123]  # Invalid type
         )
+
+
+# =============================================================================
+# Singleton Pattern Handling Tests
+# =============================================================================
+
+@pytest.fixture(autouse=True)
+def reset_lmstudio_state():
+    """Reset all LMStudio singleton state before and after each test."""
+    # Reset state before test
+    lmstudio_module._lmstudio_configured_host = None
+    llm_module._lmstudio_cache.clear()
+    
+    yield
+    
+    # Reset state after test to ensure clean state for next test
+    lmstudio_module._lmstudio_configured_host = None
+    llm_module._lmstudio_cache.clear()
+
+
+def test_lmstudio_multiple_instances_same_host(setup_lmstudio_mock, reset_lmstudio_state):
+    """Test that multiple instances with same host work correctly (no crash)."""
+    # First instance
+    client1 = LLMModelFactory.create_model(
+        model_type='lmstudio',
+        model_name='model-a',
+        host='localhost:1234'
+    )
+    assert client1 is not None
+    
+    # Second instance - different model, same host (should NOT crash!)
+    client2 = LLMModelFactory.create_model(
+        model_type='lmstudio',
+        model_name='model-b',
+        host='localhost:1234'
+    )
+    assert client2 is not None
+    assert client2 is not client1  # Different models = different instances
+    
+    # Third instance - same as first (returns cached)
+    client3 = LLMModelFactory.create_model(
+        model_type='lmstudio',
+        model_name='model-a',
+        host='localhost:1234'
+    )
+    assert client3 is client1  # Should be cached
+
+
+def test_lmstudio_api_identical_to_other_providers(setup_lmstudio_mock, reset_lmstudio_state):
+    """Test that LMStudio API is identical to other providers - same create_model() call."""
+    # This is the key test - same API, no special handling needed
+    lmstudio_client = LLMModelFactory.create_model(
+        model_type='lmstudio',
+        model_name='test-model'
+    )
+    
+    # Creating multiple instances should NOT require any special handling
+    lmstudio_client2 = LLMModelFactory.create_model(
+        model_type='lmstudio',
+        model_name='test-model-2'
+    )
+    
+    # Both should work without any singleton errors
+    assert lmstudio_client is not None
+    assert lmstudio_client2 is not None
+
+
+def test_lmstudio_host_change_warning(setup_lmstudio_mock, reset_lmstudio_state):
+    """Test that changing hosts produces a warning but doesn't crash."""
+    # First instance
+    client1 = LLMModelFactory.create_model(
+        model_type='lmstudio',
+        model_name='test-model',
+        host='localhost:1234'
+    )
+    
+    # Attempt with different host - should warn but not crash
+    with pytest.warns(UserWarning, match="Cannot change host"):
+        client2 = LLMModelFactory.create_model(
+            model_type='lmstudio',
+            model_name='other-model',
+            host='different-host:1234'
+        )
+    
+    # Should still work, using original host
+    assert client2 is not None
+    assert client2.host == 'localhost:1234'
+
+
+def test_lmstudio_cached_instance_returned(setup_lmstudio_mock, reset_lmstudio_state):
+    """Test that requesting same model returns cached instance."""
+    client1 = LLMModelFactory.create_model(
+        model_type='lmstudio',
+        model_name='test-model',
+        host='localhost:1234'
+    )
+    
+    client2 = LLMModelFactory.create_model(
+        model_type='lmstudio',
+        model_name='test-model',
+        host='localhost:1234'
+    )
+    
+    # Should be the exact same instance
+    assert client1 is client2
+
+
+def test_lmstudio_clear_cache(setup_lmstudio_mock, reset_lmstudio_state):
+    """Test cache clearing functionality."""
+    # Create and cache an instance
+    instance1 = LLMModelFactory.create_model(
+        model_type='lmstudio',
+        model_name='test-model',
+        host='localhost:1234'
+    )
+    
+    # Clear cache
+    LLMModelFactory.clear_lmstudio_cache()
+    
+    # Next call should create a new instance
+    instance2 = LLMModelFactory.create_model(
+        model_type='lmstudio',
+        model_name='test-model',
+        host='localhost:1234'
+    )
+    
+    # Should be different instances (though SDK host config remains)
+    assert instance2 is not instance1
+
+
+def test_lmstudio_get_configured_host(setup_lmstudio_mock, reset_lmstudio_state):
+    """Test getting the configured host via module function."""
+    # Initially None
+    assert lmstudio_module._get_configured_host() is None
+    
+    # After creating an instance
+    LLMModelFactory.create_model(
+        model_type='lmstudio',
+        model_name='test-model',
+        host='localhost:1234'
+    )
+    
+    assert lmstudio_module._get_configured_host() == 'localhost:1234'
+
+
+def test_lmstudio_reset_configured_host(setup_lmstudio_mock, reset_lmstudio_state):
+    """Test resetting the configured host (for testing purposes)."""
+    # Create an instance to set the host
+    LLMModelFactory.create_model(
+        model_type='lmstudio',
+        model_name='test-model',
+        host='localhost:1234'
+    )
+    
+    assert lmstudio_module._get_configured_host() == 'localhost:1234'
+    
+    # Reset the host tracking
+    lmstudio_module._reset_configured_host()
+    
+    assert lmstudio_module._get_configured_host() is None
+
+
+def test_lmstudio_thread_safety(setup_lmstudio_mock, reset_lmstudio_state):
+    """Test thread safety of the caching mechanism."""
+    results = []
+    errors = []
+    
+    def create_instance(model_name):
+        try:
+            instance = LLMModelFactory.create_model(
+                model_type='lmstudio',
+                model_name=model_name,
+                host='localhost:1234'
+            )
+            results.append((model_name, instance))
+        except Exception as e:
+            errors.append(e)
+    
+    # Create multiple threads
+    threads = []
+    for i in range(10):
+        t = threading.Thread(target=create_instance, args=(f'model-{i % 3}',))
+        threads.append(t)
+    
+    # Start all threads
+    for t in threads:
+        t.start()
+    
+    # Wait for completion
+    for t in threads:
+        t.join()
+    
+    # Should have no errors
+    assert len(errors) == 0
+    
+    # Instances with same model name should be identical
+    model_instances = {}
+    for model_name, instance in results:
+        if model_name not in model_instances:
+            model_instances[model_name] = instance
+        else:
+            assert model_instances[model_name] is instance
+
+
+def test_lmstudio_direct_instantiation_singleton_handling(setup_lmstudio_mock, reset_lmstudio_state):
+    """Test that direct instantiation also handles the singleton pattern."""
+    # Direct instantiation (not through factory)
+    model1 = LMStudioInference(model_name="test-model", host="localhost:1234")
+    
+    # Second direct instantiation - should not crash
+    model2 = LMStudioInference(model_name="test-model-2", host="localhost:1234")
+    
+    assert model1 is not None
+    assert model2 is not None
+    # Direct instantiation doesn't use the factory cache, so these are different instances
+    assert model1 is not model2
+
+
+def test_lmstudio_configure_default_client_called_once(setup_lmstudio_mock, reset_lmstudio_state):
+    """Test that configure_default_client is only called once."""
+    # Create first instance
+    LLMModelFactory.create_model(
+        model_type='lmstudio',
+        model_name='model-a',
+        host='localhost:1234'
+    )
+    
+    # Create second instance with same host
+    LLMModelFactory.create_model(
+        model_type='lmstudio',
+        model_name='model-b',
+        host='localhost:1234'
+    )
+    
+    # configure_default_client should only be called once
+    assert setup_lmstudio_mock.configure_default_client.call_count == 1

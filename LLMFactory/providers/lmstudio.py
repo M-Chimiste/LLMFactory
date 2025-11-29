@@ -14,11 +14,39 @@
 
 """LM Studio inference provider."""
 
+import logging
 import os
+import threading
+import warnings
 from typing import List, Dict, Union, Optional, Iterator
+
 from pydantic import BaseModel
 
 from .base import InferenceModel, _encode_image
+
+logger = logging.getLogger(__name__)
+
+# Module-level state for handling LMStudio SDK's singleton pattern.
+# The SDK only allows configure_default_client() to be called once per process.
+_lmstudio_configured_host: Optional[str] = None
+_host_lock = threading.Lock()
+
+
+def _get_configured_host() -> Optional[str]:
+    """Return the currently configured LMStudio host, or None if not yet configured."""
+    return _lmstudio_configured_host
+
+
+def _reset_configured_host() -> None:
+    """
+    Reset the configured host tracking (for testing purposes only).
+    
+    WARNING: This does NOT reset the actual LMStudio SDK state.
+    The SDK's default client cannot be reconfigured without restarting the process.
+    """
+    global _lmstudio_configured_host
+    with _host_lock:
+        _lmstudio_configured_host = None
 
 
 class LMStudioInference(InferenceModel):
@@ -69,7 +97,9 @@ class LMStudioInference(InferenceModel):
         return "lmstudio"
 
     def _load_model(self):
-        """Initialize the LM Studio client."""
+        """Initialize the LM Studio client with singleton-aware configuration."""
+        global _lmstudio_configured_host
+        
         try:
             import lmstudio as lms
             self._lms_module = lms
@@ -85,8 +115,25 @@ class LMStudioInference(InferenceModel):
                 "Ensure LM Studio is running and network access is enabled if remote."
             )
 
-        # Configure the default client to use the specified host
-        lms.configure_default_client(self.host)
+        # Handle the SDK's singleton pattern - only configure once per process
+        with _host_lock:
+            if _lmstudio_configured_host is None:
+                # First configuration - set the default client
+                lms.configure_default_client(self.host)
+                _lmstudio_configured_host = self.host
+                logger.info(f"Configured LMStudio default client for host: {self.host}")
+            elif _lmstudio_configured_host != self.host:
+                # Different host requested - this is an SDK limitation
+                warnings.warn(
+                    f"LMStudio SDK limitation: Cannot change host from "
+                    f"'{_lmstudio_configured_host}' to '{self.host}'. "
+                    f"Using previously configured host. Restart Python process to change hosts.",
+                    UserWarning
+                )
+                # Update self.host to match the actual configured host
+                self.host = _lmstudio_configured_host
+            # else: same host, already configured - nothing to do
+        
         return lms
 
     def _get_or_load_model(self):

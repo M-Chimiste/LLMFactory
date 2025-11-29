@@ -21,7 +21,9 @@ the 'providers' submodule for better maintainability and modularity.
 """
 
 import inspect
-from typing import Dict, Type
+import os
+import threading
+from typing import Dict, Tuple, Type
 
 # Import all providers from the providers module
 from .providers import (
@@ -38,6 +40,11 @@ from .providers import (
     SentenceTransformerInference,
     LlamacppInference,
 )
+
+# Internal cache for LMStudio instances (handles SDK singleton pattern)
+# Key: (host, model_name), Value: LMStudioInference instance
+_lmstudio_cache: Dict[Tuple[str, str], LMStudioInference] = {}
+_lmstudio_cache_lock = threading.Lock()
 
 
 class LLMModelFactory:
@@ -58,17 +65,62 @@ class LLMModelFactory:
     }
 
     @classmethod
+    def _get_lmstudio_instance(cls, **kwargs) -> LMStudioInference:
+        """
+        Internal method to get or create an LMStudio instance.
+        
+        Handles the LMStudio SDK's singleton pattern by caching instances
+        by (host, model_name) key. This is transparent to users.
+        """
+        model_name = kwargs.get('model_name', '')
+        host = kwargs.get('host') or os.environ.get('LMSTUDIO_HOST', 'localhost:1234')
+        cache_key = (host, model_name)
+        
+        with _lmstudio_cache_lock:
+            if cache_key in _lmstudio_cache:
+                return _lmstudio_cache[cache_key]
+            
+            # Create new instance using standard instantiation
+            instance = LMStudioInference(**kwargs)
+            _lmstudio_cache[cache_key] = instance
+            return instance
+
+    @classmethod
+    def clear_lmstudio_cache(cls) -> None:
+        """
+        Clear the LMStudio instance cache.
+        
+        Note: This does NOT reset the LMStudio SDK's singleton state.
+        The default client host cannot be changed without restarting the process.
+        """
+        with _lmstudio_cache_lock:
+            for instance in _lmstudio_cache.values():
+                try:
+                    instance.close()
+                except Exception:
+                    pass
+            _lmstudio_cache.clear()
+
+    @classmethod
     def create_model(cls, model_type: str, **kwargs) -> InferenceModel:
         """
         Create and return an instance of the specified inference model.
+        
         This method inspects the model's constructor and only passes arguments
         that it can accept, preventing TypeErrors for unexpected keywords.
+        
+        For LMStudio, instances are cached to handle the SDK's singleton pattern.
+        This is transparent - the API is identical for all providers.
         """
         model_class = cls._models.get(model_type.lower())
         if not model_class:
             raise ValueError(f"Unknown model type: {model_type}")
 
-        # Inspect the constructor signature to filter out unexpected arguments
+        # LMStudio requires special handling due to SDK singleton pattern
+        if model_type.lower() == 'lmstudio':
+            return cls._get_lmstudio_instance(**kwargs)
+
+        # Standard handling for other providers
         sig = inspect.signature(model_class.__init__)
         allowed_args = {p.name for p in sig.parameters.values()}
 
