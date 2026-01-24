@@ -679,3 +679,189 @@ def test_lmstudio_configure_default_client_called_once(setup_lmstudio_mock, rese
     
     # configure_default_client should only be called once
     assert setup_lmstudio_mock.configure_default_client.call_count == 1
+
+
+# =============================================================================
+# Thinking Mode Tests
+# =============================================================================
+
+def test_lmstudio_thinking_returns_thinking_response(setup_lmstudio_mock):
+    """Test that use_thinking=True with return_thinking=True returns ThinkingResponse."""
+    from LLMFactory.llm import ThinkingResponse
+
+    mock_response = Mock()
+    mock_response.json.return_value = {
+        'output': [
+            {'type': 'reasoning', 'content': [{'text': 'Step by step reasoning...'}]},
+            {'type': 'message', 'content': [{'text': 'The answer is 42.'}]}
+        ]
+    }
+    mock_response.raise_for_status = Mock()
+
+    with patch('LLMFactory.providers.lmstudio.requests.post', return_value=mock_response) as mock_post:
+        model = LMStudioInference(model_name="test-model")
+        response = model.invoke(
+            [{"role": "user", "content": "Question"}],
+            "System prompt",
+            use_thinking=True,
+            return_thinking=True
+        )
+
+        assert isinstance(response, ThinkingResponse)
+        assert response.content == 'The answer is 42.'
+        assert response.thinking == 'Step by step reasoning...'
+        assert mock_post.call_args[1]['json']['reasoning']['effort'] == 'medium'
+
+
+def test_lmstudio_thinking_returns_content_only(setup_lmstudio_mock):
+    """Test that use_thinking=True with return_thinking=False returns only content."""
+    mock_response = Mock()
+    mock_response.json.return_value = {
+        'output': [
+            {'type': 'reasoning', 'content': [{'text': 'Thinking...'}]},
+            {'type': 'message', 'content': [{'text': 'Final answer.'}]}
+        ]
+    }
+    mock_response.raise_for_status = Mock()
+
+    with patch('LLMFactory.providers.lmstudio.requests.post', return_value=mock_response):
+        model = LMStudioInference(model_name="test-model")
+        response = model.invoke(
+            [{"role": "user", "content": "Question"}],
+            "System",
+            use_thinking=True,
+            return_thinking=False
+        )
+
+        assert isinstance(response, str)
+        assert response == 'Final answer.'
+
+
+def test_lmstudio_thinking_effort_levels(setup_lmstudio_mock):
+    """Test that effort levels are passed correctly to the API."""
+    for effort in ["low", "medium", "high"]:
+        mock_response = Mock()
+        mock_response.json.return_value = {
+            'output': [{'type': 'message', 'content': [{'text': 'OK'}]}]
+        }
+        mock_response.raise_for_status = Mock()
+
+        with patch('LLMFactory.providers.lmstudio.requests.post', return_value=mock_response) as mock_post:
+            model = LMStudioInference(model_name="test-model")
+            model.invoke(
+                [{"role": "user", "content": "Q"}],
+                "S",
+                use_thinking=effort,
+                return_thinking=True
+            )
+
+            assert mock_post.call_args[1]['json']['reasoning']['effort'] == effort
+
+
+def test_lmstudio_thinking_disabled_uses_sdk(setup_lmstudio_mock, sample_messages, sample_system_prompt):
+    """Test that thinking disabled uses SDK instead of REST API."""
+    mock_model = Mock()
+    mock_model_response = Mock()
+    mock_model_response.content = "SDK response"
+    mock_model.respond.return_value = mock_model_response
+    setup_lmstudio_mock.llm.return_value = mock_model
+    setup_lmstudio_mock.Chat.return_value = Mock()
+
+    with patch('LLMFactory.providers.lmstudio.requests.post') as mock_post:
+        model = LMStudioInference(model_name="test-model")
+        response = model.invoke(sample_messages, sample_system_prompt)
+
+        mock_post.assert_not_called()
+        mock_model.respond.assert_called_once()
+        assert response == "SDK response"
+
+
+def test_lmstudio_thinking_rest_api_error(setup_lmstudio_mock):
+    """Test that REST API errors are handled gracefully."""
+    import requests as req
+
+    with patch('LLMFactory.providers.lmstudio.requests.post') as mock_post:
+        mock_post.side_effect = req.RequestException("Connection failed")
+
+        model = LMStudioInference(model_name="test-model")
+
+        with pytest.raises(RuntimeError, match="Error during LM Studio REST API call"):
+            model.invoke(
+                [{"role": "user", "content": "Q"}],
+                "S",
+                use_thinking=True
+            )
+
+
+def test_lmstudio_thinking_images_warning(setup_lmstudio_mock, caplog):
+    """Test that using images with thinking logs a warning."""
+    import logging
+
+    mock_response = Mock()
+    mock_response.json.return_value = {
+        'output': [{'type': 'message', 'content': [{'text': 'OK'}]}]
+    }
+    mock_response.raise_for_status = Mock()
+
+    with patch('LLMFactory.providers.lmstudio.requests.post', return_value=mock_response):
+        with caplog.at_level(logging.WARNING):
+            model = LMStudioInference(model_name="test-model")
+            model.invoke(
+                [{"role": "user", "content": "Q"}],
+                "S",
+                use_thinking=True,
+                images=["test.jpg"]
+            )
+
+            assert "Images are not supported with thinking mode" in caplog.text
+
+
+def test_lmstudio_thinking_message_formatting(setup_lmstudio_mock):
+    """Test that messages are formatted correctly for the REST API."""
+    mock_response = Mock()
+    mock_response.json.return_value = {
+        'output': [{'type': 'message', 'content': [{'text': 'OK'}]}]
+    }
+    mock_response.raise_for_status = Mock()
+
+    messages = [
+        {"role": "user", "content": "Hello"},
+        {"role": "assistant", "content": "Hi!"},
+        {"role": "user", "content": "How are you?"}
+    ]
+
+    with patch('LLMFactory.providers.lmstudio.requests.post', return_value=mock_response) as mock_post:
+        model = LMStudioInference(model_name="test-model")
+        model.invoke(messages, "Be helpful.", use_thinking=True)
+
+        input_text = mock_post.call_args[1]['json']['input']
+        assert "System: Be helpful." in input_text
+        assert "User: Hello" in input_text
+        assert "Assistant: Hi!" in input_text
+        assert "User: How are you?" in input_text
+
+
+def test_lmstudio_thinking_no_reasoning_in_response(setup_lmstudio_mock):
+    """Test handling when API returns no reasoning (non-thinking model)."""
+    from LLMFactory.llm import ThinkingResponse
+
+    mock_response = Mock()
+    mock_response.json.return_value = {
+        'output': [
+            {'type': 'message', 'content': [{'text': 'Direct response'}]}
+        ]
+    }
+    mock_response.raise_for_status = Mock()
+
+    with patch('LLMFactory.providers.lmstudio.requests.post', return_value=mock_response):
+        model = LMStudioInference(model_name="test-model")
+        response = model.invoke(
+            [{"role": "user", "content": "Q"}],
+            "S",
+            use_thinking=True,
+            return_thinking=True
+        )
+
+        assert isinstance(response, ThinkingResponse)
+        assert response.content == 'Direct response'
+        assert response.thinking is None
