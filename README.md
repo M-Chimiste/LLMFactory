@@ -740,7 +740,7 @@ This project is licensed under the Apache License 2.0 - see the [LICENSE](LICENS
 
 ## Changelog
 
-### v0.2.2 (Thinking/Reasoning Mode)
+### v0.2.5 (Thinking/Reasoning Mode)
 - **🧠 Thinking Mode**: Added `use_thinking` and `return_thinking` parameters for Ollama and LM Studio
 - **📦 ThinkingResponse**: New dataclass containing both `thinking` (reasoning trace) and `content` (final answer)
 - **🔧 Ollama**: Uses native `think` parameter, supports `True`/`False` or `"low"`/`"medium"`/`"high"` effort levels
