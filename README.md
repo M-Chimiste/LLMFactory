@@ -10,6 +10,7 @@ A unified factory pattern interface for multiple LLM inference providers with mu
 - **Unified Interface**: Single API for multiple LLM providers
 - **Multimodal Support**: Built-in image processing for vision-capable models
 - **Streaming Support**: Token-by-token streaming for all providers
+- **Thinking/Reasoning Mode**: Access model reasoning traces (Ollama, LM Studio)
 - **Schema Support**: Structured JSON output with Pydantic models
 - **Flexible Configuration**: Environment variables, direct parameters, or config files
 - **Type Safety**: Full type hints for better IDE support
@@ -138,6 +139,33 @@ model = LLMModelFactory.create_model(
     url='http://localhost:11434',
     num_ctx=8192,
     temperature=0.7
+)
+```
+
+#### Ollama Thinking Mode
+
+```python
+from LLMFactory.llm import OllamaInference
+
+model = OllamaInference(model_name="qwen3")
+
+# Enable thinking and return both thinking trace and answer
+response = model.invoke(
+    messages=[{"role": "user", "content": "What is 25 * 4?"}],
+    system_prompt="You are a helpful assistant.",
+    use_thinking=True,
+    return_thinking=True
+)
+
+print(f"Thinking: {response.thinking}")
+print(f"Answer: {response.content}")
+
+# For GPT-OSS models, use effort levels
+response = model.invoke(
+    messages=[{"role": "user", "content": "Explain quantum entanglement"}],
+    system_prompt="You are a physics teacher.",
+    use_thinking="high",  # "low", "medium", or "high"
+    return_thinking=True
 )
 ```
 
@@ -340,6 +368,40 @@ response = model.invoke(
 )
 ```
 
+#### Thinking/Reasoning Mode
+
+LM Studio supports thinking mode for models with reasoning capabilities (e.g., `zai-org/glm-4.7-flash`). When enabled, the model shows its reasoning process before providing an answer.
+
+```python
+from LLMFactory.llm import LMStudioInference
+
+model = LMStudioInference(model_name="zai-org/glm-4.7-flash")
+
+# Enable thinking with effort level
+response = model.invoke(
+    messages=[{"role": "user", "content": "What is the derivative of x^2?"}],
+    system_prompt="You are a calculus tutor.",
+    use_thinking="medium",  # "low", "medium", or "high"
+    return_thinking=True
+)
+
+print(f"Reasoning: {response.thinking}")
+print(f"Answer: {response.content}")
+
+# Models without thinking support still work (thinking will be None)
+model2 = LMStudioInference(model_name="granite-4.0-h-tiny-mlx")
+response2 = model2.invoke(
+    messages=[{"role": "user", "content": "Hello"}],
+    system_prompt="Be helpful.",
+    use_thinking=True,
+    return_thinking=True
+)
+print(f"Thinking: {response2.thinking}")  # None for non-thinking models
+print(f"Content: {response2.content}")
+```
+
+> **Note**: When `use_thinking` is enabled, LM Studio uses the `/v1/responses` REST endpoint instead of the SDK. Some features like images and schema are not available in thinking mode.
+
 ### Custom OpenAI-Compatible API
 
 ```python
@@ -437,6 +499,64 @@ response = model.invoke(
 )
 ```
 
+### Thinking/Reasoning Mode
+
+Some models support "thinking" or "reasoning" mode, where they show their step-by-step thought process before providing an answer. LLMFactory provides a unified interface for this feature across supported providers (Ollama, LM Studio).
+
+```python
+from LLMFactory.llm import OllamaInference, ThinkingResponse
+
+# Enable thinking mode and get both thinking trace and content
+model = OllamaInference(model_name="qwen3")
+response = model.invoke(
+    messages=[{"role": "user", "content": "What is 15 * 23?"}],
+    system_prompt="You are a math tutor.",
+    use_thinking=True,
+    return_thinking=True
+)
+
+# Response is a ThinkingResponse object
+print(f"Thinking: {response.thinking}")
+print(f"Answer: {response.content}")
+```
+
+**Parameters:**
+- `use_thinking`: Enable thinking mode. Can be:
+  - `True`/`False` - Enable/disable thinking
+  - `"low"`, `"medium"`, `"high"` - Effort level (provider-specific)
+- `return_thinking`: If `True`, return a `ThinkingResponse` with both `thinking` and `content` fields. If `False` (default), return only the content string.
+
+**Provider-Specific Behavior:**
+
+| Provider | Parameter | API Used |
+|----------|-----------|----------|
+| Ollama | `think=True/False` or `"low"/"medium"/"high"` | Native `think` parameter |
+| LM Studio | `reasoning.effort: "low"/"medium"/"high"` | REST `/v1/responses` endpoint |
+
+**Example with LM Studio:**
+
+```python
+from LLMFactory.llm import LMStudioInference
+
+model = LMStudioInference(model_name="zai-org/glm-4.7-flash")
+
+# High effort reasoning
+response = model.invoke(
+    messages=[{"role": "user", "content": "Solve: If a train travels 120km in 2 hours, what is its speed?"}],
+    system_prompt="You are a physics tutor.",
+    use_thinking="high",
+    return_thinking=True
+)
+
+print(f"Reasoning: {response.thinking}")
+print(f"Answer: {response.content}")
+```
+
+**Notes:**
+- Models that don't support thinking will return `thinking=None` even when `use_thinking=True`
+- Streaming with thinking is supported - thinking tokens are prefixed with `[THINKING]`
+- When `return_thinking=False` (default), only content is returned for backward compatibility
+
 ### Custom Model Parameters
 
 Each provider supports specific parameters:
@@ -505,11 +625,11 @@ LLMModelFactory.create_model() -> InferenceModel
 **Import Flexibility:**
 ```python
 # Import from main module (recommended for compatibility)
-from LLMFactory.llm import OllamaInference, LLMModelFactory
+from LLMFactory.llm import OllamaInference, LLMModelFactory, ThinkingResponse
 
 # Import from specific provider module
 from LLMFactory.providers.ollama import OllamaInference
-from LLMFactory.providers import AnthropicInference
+from LLMFactory.providers import AnthropicInference, ThinkingResponse
 ```
 
 ## Development
@@ -619,6 +739,14 @@ This project is licensed under the Apache License 2.0 - see the [LICENSE](LICENS
 - Documentation: [https://github.com/M-Chimiste/LLMFactory](https://github.com/M-Chimiste/LLMFactory)
 
 ## Changelog
+
+### v0.2.2 (Thinking/Reasoning Mode)
+- **🧠 Thinking Mode**: Added `use_thinking` and `return_thinking` parameters for Ollama and LM Studio
+- **📦 ThinkingResponse**: New dataclass containing both `thinking` (reasoning trace) and `content` (final answer)
+- **🔧 Ollama**: Uses native `think` parameter, supports `True`/`False` or `"low"`/`"medium"`/`"high"` effort levels
+- **🔧 LM Studio**: Uses `/v1/responses` REST endpoint with `reasoning.effort` parameter
+- **📡 Streaming Support**: Thinking mode works with streaming (thinking tokens prefixed with `[THINKING]`)
+- **✅ Graceful Fallback**: Non-thinking models return `thinking=None` when thinking is requested
 
 ### v0.2.1 (LM Studio Singleton Handling)
 - **🔧 LMStudio Fix**: Resolved `LMStudioClientError: Default client is already created` error

@@ -14,15 +14,17 @@
 
 """LM Studio inference provider."""
 
+import json
 import logging
 import os
 import threading
 import warnings
 from typing import List, Dict, Union, Optional, Iterator
 
+import requests
 from pydantic import BaseModel
 
-from .base import InferenceModel, _encode_image
+from .base import InferenceModel, _encode_image, ThinkingResponse
 
 logger = logging.getLogger(__name__)
 
@@ -162,6 +164,129 @@ class LMStudioInference(InferenceModel):
 
         return self._model_instance
 
+    def _format_messages_for_rest(self, messages: List[Dict[str, str]], system_prompt: str) -> str:
+        """Format messages into a single input string for the REST API."""
+        parts = []
+        if system_prompt:
+            parts.append(f"System: {system_prompt}")
+        for msg in messages:
+            role = msg.get("role", "user").capitalize()
+            content = msg.get("content", "")
+            if role.lower() != "system":  # Skip system messages, already added
+                parts.append(f"{role}: {content}")
+        return "\n\n".join(parts)
+
+    def _invoke_with_thinking(
+        self,
+        messages: List[Dict[str, str]],
+        system_prompt: str,
+        *,
+        streaming: bool = False,
+        model_name: Optional[str] = None,
+        use_thinking: Union[bool, str] = True,
+        return_thinking: bool = False,
+        **kwargs
+    ) -> Union[str, ThinkingResponse, Iterator[str]]:
+        """
+        Invoke LM Studio with thinking/reasoning mode using the /v1/responses REST endpoint.
+        
+        This method bypasses the SDK to use the REST API which supports reasoning parameters.
+        """
+        # Determine effort level
+        if isinstance(use_thinking, str):
+            effort = use_thinking
+        else:
+            effort = "medium"  # Default effort level
+        
+        # Build the REST API URL
+        # Handle host format (may or may not include protocol)
+        host = self.host
+        if not host.startswith("http"):
+            host = f"http://{host}"
+        url = f"{host}/v1/responses"
+        
+        # Format the input
+        input_text = self._format_messages_for_rest(messages, system_prompt)
+        
+        # Build request payload
+        payload = {
+            "model": model_name or self.model_name,
+            "input": input_text,
+            "reasoning": {"effort": effort},
+            "max_tokens": kwargs.get("max_tokens", self.max_new_tokens),
+            "temperature": kwargs.get("temperature", self.temperature),
+        }
+        
+        if streaming:
+            payload["stream"] = True
+            
+            def _gen_thinking_stream() -> Iterator[str]:
+                try:
+                    with requests.post(url, json=payload, stream=True, timeout=300) as resp:
+                        resp.raise_for_status()
+                        thinking_parts = []
+                        content_parts = []
+                        
+                        for line in resp.iter_lines():
+                            if not line:
+                                continue
+                            line_str = line.decode('utf-8')
+                            if line_str.startswith('data: '):
+                                data_str = line_str[6:]
+                                if data_str == '[DONE]':
+                                    break
+                                try:
+                                    data = json.loads(data_str)
+                                    # Handle SSE events from /v1/responses
+                                    if 'output' in data:
+                                        for item in data.get('output', []):
+                                            item_type = item.get('type', '')
+                                            for content_item in item.get('content', []):
+                                                text = content_item.get('text', '')
+                                                if text:
+                                                    if item_type == 'reasoning':
+                                                        if return_thinking:
+                                                            yield f"[THINKING]{text}"
+                                                    else:
+                                                        yield text
+                                except json.JSONDecodeError:
+                                    continue
+                except requests.RequestException as e:
+                    raise RuntimeError(f"Error during LM Studio REST API call: {e}") from e
+            
+            return _gen_thinking_stream()
+        else:
+            # Non-streaming request
+            try:
+                response = requests.post(url, json=payload, timeout=300)
+                response.raise_for_status()
+                data = response.json()
+                
+                # Parse the structured response
+                reasoning_text = None
+                content_text = None
+                
+                for item in data.get('output', []):
+                    item_type = item.get('type', '')
+                    for content_item in item.get('content', []):
+                        text = content_item.get('text', '')
+                        if item_type == 'reasoning':
+                            reasoning_text = text
+                        elif item_type == 'message':
+                            content_text = text
+                
+                # Fallback if content not found
+                if content_text is None:
+                    content_text = ""
+                
+                if return_thinking:
+                    return ThinkingResponse(content=content_text, thinking=reasoning_text)
+                else:
+                    return content_text
+                    
+            except requests.RequestException as e:
+                raise RuntimeError(f"Error during LM Studio REST API call: {e}") from e
+
     def invoke(self,
                messages: List[Dict[str, str]],
                system_prompt: str,
@@ -170,7 +295,9 @@ class LMStudioInference(InferenceModel):
                model_name: Optional[str] = None,
                schema: Optional[BaseModel] = None,
                images: Optional[List[Union[str, bytes]]] = None,
-               **kwargs) -> Union[str, Iterator[str]]:
+               use_thinking: Union[bool, str] = False,
+               return_thinking: bool = False,
+               **kwargs) -> Union[str, ThinkingResponse, Iterator[str]]:
         """
         Invoke the LM Studio model to generate a response.
 
@@ -182,13 +309,21 @@ class LMStudioInference(InferenceModel):
             schema (Optional[BaseModel]): Pydantic schema for structured JSON output
             images (Optional[List[Union[str, bytes]]]): Images for multimodal models (VLMs).
                                                         Can be file paths or raw bytes.
+            use_thinking (Union[bool, str], optional): Enable thinking/reasoning mode.
+                Can be True (uses "medium" effort), False (disabled), or a string
+                "low"/"medium"/"high" to specify effort level. When enabled, uses
+                the /v1/responses REST endpoint. Defaults to False.
+            return_thinking (bool, optional): If True and use_thinking is enabled,
+                return a ThinkingResponse containing both thinking trace and content.
+                If False, return only the content. Defaults to False.
             **kwargs: Additional parameters:
                      - max_tokens: Override max_new_tokens
                      - temperature: Override temperature
                      - top_p, top_k, stop: Sampling parameters
 
         Returns:
-            Union[str, Iterator[str]]: Full response string or iterator yielding tokens if streaming=True
+            Union[str, ThinkingResponse, Iterator[str]]: Full response string, ThinkingResponse
+                (if return_thinking=True), or iterator yielding tokens if streaming=True
 
         Examples:
             # Simple query
@@ -200,6 +335,16 @@ class LMStudioInference(InferenceModel):
             # Streaming
             for token in llm.invoke(messages, system, streaming=True):
                 print(token, end="", flush=True)
+
+            # With thinking/reasoning mode
+            response = llm.invoke(
+                [{"role": "user", "content": "Solve: 15 * 23"}],
+                "You are a math tutor.",
+                use_thinking="high",
+                return_thinking=True
+            )
+            print(f"Thinking: {response.thinking}")
+            print(f"Answer: {response.content}")
 
             # With images (VLM)
             response = llm.invoke(
@@ -216,6 +361,23 @@ class LMStudioInference(InferenceModel):
 
             response = llm.invoke(messages, system, schema=Answer)
         """
+        # If thinking mode is enabled, use the REST API endpoint
+        if use_thinking:
+            if images:
+                logger.warning("Images are not supported with thinking mode. Ignoring images.")
+            if schema:
+                logger.warning("Schema is not supported with thinking mode. Ignoring schema.")
+            return self._invoke_with_thinking(
+                messages=messages,
+                system_prompt=system_prompt,
+                streaming=streaming,
+                model_name=model_name,
+                use_thinking=use_thinking,
+                return_thinking=return_thinking,
+                **kwargs
+            )
+        
+        # Standard path using the SDK
         # Get or load the model
         model = self._get_or_load_model()
 

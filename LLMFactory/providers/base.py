@@ -16,7 +16,23 @@
 
 import base64
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
 from typing import List, Dict, Union, Optional, Iterator
+
+
+@dataclass
+class ThinkingResponse:
+    """Response containing both thinking trace and final content.
+    
+    Used when invoking models with thinking/reasoning mode enabled
+    and return_thinking=True.
+    
+    Attributes:
+        content: The final answer/response from the model.
+        thinking: The reasoning trace (None if not available or not requested).
+    """
+    content: str
+    thinking: Optional[str] = None
 
 
 def _encode_image(image_data: Union[str, bytes]) -> str:
