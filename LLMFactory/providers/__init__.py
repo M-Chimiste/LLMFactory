@@ -14,7 +14,7 @@
 
 """LLMFactory providers module - modular LLM inference providers."""
 
-from .base import InferenceModel, _encode_image
+from .base import InferenceModel, _encode_image, ThinkingResponse
 from .ollama import OllamaInference, OllamaEmbedInference
 from .lmstudio import LMStudioInference
 from .anthropic import AnthropicInference, AnthropicBedrockInference
@@ -27,6 +27,7 @@ __all__ = [
     # Base classes
     'InferenceModel',
     '_encode_image',
+    'ThinkingResponse',
 
     # Ollama providers
     'OllamaInference',

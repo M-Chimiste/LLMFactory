@@ -29,6 +29,7 @@ from typing import Dict, Tuple, Type
 from .providers import (
     InferenceModel,
     _encode_image,
+    ThinkingResponse,
     OllamaInference,
     OllamaEmbedInference,
     LMStudioInference,
@@ -145,6 +146,7 @@ __all__ = [
     # Base class and utilities
     'InferenceModel',
     '_encode_image',
+    'ThinkingResponse',
 
     # All provider classes
     'OllamaInference',

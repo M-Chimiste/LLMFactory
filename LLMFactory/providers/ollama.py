@@ -19,7 +19,7 @@ import numpy as np
 from typing import List, Dict, Union, Optional, Iterator
 from pydantic import BaseModel
 
-from .base import InferenceModel, _encode_image
+from .base import InferenceModel, _encode_image, ThinkingResponse
 
 
 class OllamaInference(InferenceModel):
@@ -61,7 +61,9 @@ class OllamaInference(InferenceModel):
                streaming: bool = False,
                model_name: Optional[str] = None, num_ctx: Optional[int] = None,
                schema: Optional[BaseModel] = None,
-               images: Optional[List[Union[str, bytes]]] = None) -> Union[str, Iterator[str]]:
+               images: Optional[List[Union[str, bytes]]] = None,
+               use_thinking: Union[bool, str] = False,
+               return_thinking: bool = False) -> Union[str, ThinkingResponse, Iterator[str]]:
         """
         Invokes the Ollama model to generate a response based on the provided messages and system prompt.
 
@@ -77,9 +79,15 @@ class OllamaInference(InferenceModel):
             num_ctx (Optional[int], optional): The number of context tokens to use. Defaults to the num_ctx set in the constructor.
             schema (Optional[BaseModel], optional): The schema to use for formatting the response. Defaults to None.
             images (Optional[List[Union[str, bytes]]], optional): List of image paths or bytes for multimodal inference. Defaults to None.
+            use_thinking (Union[bool, str], optional): Enable thinking/reasoning mode. Can be True/False for most models,
+                or "low"/"medium"/"high" for GPT-OSS models. Defaults to False.
+            return_thinking (bool, optional): If True and use_thinking is enabled, return a ThinkingResponse
+                containing both the thinking trace and final content. If False, return only the content. Defaults to False.
 
         Returns:
-            Union[str, Iterator[str]]: The response from the model, either as a full string or an iterator over tokens.
+            Union[str, ThinkingResponse, Iterator[str]]: The response from the model. Returns ThinkingResponse if
+                return_thinking=True and use_thinking is enabled. Returns Iterator[str] if streaming=True.
+                Otherwise returns the content string.
         """
         full_messages = [{"role": "system", "content": system_prompt}] + messages
         if images:
@@ -91,44 +99,55 @@ class OllamaInference(InferenceModel):
             "num_ctx": self.num_ctx
         }
 
-        if streaming:
-            if schema:
-                stream = self.client.chat(
-                    model=model_name or self.model_name,
-                    messages=full_messages,
-                    format=schema.model_json_schema(),
-                    options=options,
-                    stream=True
-                )
-            else:
-                stream = self.client.chat(
-                    model=model_name or self.model_name,
-                    messages=full_messages,
-                    options=options,
-                    stream=True
-                )
+        # Build common kwargs for chat call
+        chat_kwargs = {
+            "model": model_name or self.model_name,
+            "messages": full_messages,
+            "options": options,
+        }
+        if schema:
+            chat_kwargs["format"] = schema.model_json_schema()
+        if use_thinking:
+            chat_kwargs["think"] = use_thinking
 
-            def _gen() -> Iterator[str]:
-                for chunk in stream:
-                    content = chunk["message"]["content"]
-                    if content:
-                        yield content
-            return _gen()
-        else:
-            if schema:
-                response = self.client.chat(
-                    model=model_name or self.model_name,
-                    messages=full_messages,
-                    format=schema.model_json_schema(),
-                    options=options
-                )
+        if streaming:
+            chat_kwargs["stream"] = True
+            stream = self.client.chat(**chat_kwargs)
+
+            if use_thinking and return_thinking:
+                # Streaming with thinking - yield ThinkingResponse chunks or accumulate
+                def _gen_with_thinking() -> Iterator[str]:
+                    thinking_parts = []
+                    content_parts = []
+                    for chunk in stream:
+                        msg = chunk.get("message", {})
+                        thinking = msg.get("thinking", "")
+                        content = msg.get("content", "")
+                        if thinking:
+                            thinking_parts.append(thinking)
+                            yield f"[THINKING]{thinking}"
+                        if content:
+                            content_parts.append(content)
+                            yield content
+                return _gen_with_thinking()
             else:
-                response = self.client.chat(
-                    model=model_name or self.model_name,
-                    messages=full_messages,
-                    options=options
-                )
-            return response['message']['content']
+                # Standard streaming - yield only content
+                def _gen() -> Iterator[str]:
+                    for chunk in stream:
+                        content = chunk["message"]["content"]
+                        if content:
+                            yield content
+                return _gen()
+        else:
+            response = self.client.chat(**chat_kwargs)
+            
+            content = response['message']['content']
+            thinking = response['message'].get('thinking', None) if use_thinking else None
+            
+            if use_thinking and return_thinking:
+                return ThinkingResponse(content=content, thinking=thinking)
+            else:
+                return content
 
 
 class OllamaEmbedInference(InferenceModel):
