@@ -865,3 +865,261 @@ def test_lmstudio_thinking_no_reasoning_in_response(setup_lmstudio_mock):
         assert isinstance(response, ThinkingResponse)
         assert response.content == 'Direct response'
         assert response.thinking is None
+
+
+# =============================================================================
+# Model Loading Status Tests
+# =============================================================================
+
+def test_lmstudio_is_model_loaded_true(setup_lmstudio_mock, reset_lmstudio_state):
+    """Test is_model_loaded returns True when model is loaded."""
+    mock_loaded_model = Mock()
+    mock_loaded_model.identifier = "test-model"
+    setup_lmstudio_mock.list_loaded_models.return_value = [mock_loaded_model]
+    
+    model = LMStudioInference(model_name="test-model")
+    assert model.is_model_loaded() is True
+
+
+def test_lmstudio_is_model_loaded_false(setup_lmstudio_mock, reset_lmstudio_state):
+    """Test is_model_loaded returns False when model is not loaded."""
+    setup_lmstudio_mock.list_loaded_models.return_value = []
+    
+    model = LMStudioInference(model_name="test-model")
+    assert model.is_model_loaded() is False
+
+
+def test_lmstudio_is_model_loaded_different_model(setup_lmstudio_mock, reset_lmstudio_state):
+    """Test is_model_loaded returns False when a different model is loaded."""
+    mock_loaded_model = Mock()
+    mock_loaded_model.identifier = "other-model"
+    setup_lmstudio_mock.list_loaded_models.return_value = [mock_loaded_model]
+    
+    model = LMStudioInference(model_name="test-model")
+    assert model.is_model_loaded() is False
+
+
+def test_lmstudio_is_model_loaded_exception(setup_lmstudio_mock, reset_lmstudio_state):
+    """Test is_model_loaded handles exceptions gracefully."""
+    setup_lmstudio_mock.list_loaded_models.side_effect = Exception("API error")
+    
+    model = LMStudioInference(model_name="test-model")
+    assert model.is_model_loaded() is False
+
+
+def test_lmstudio_verify_connected_and_loaded(setup_lmstudio_mock, reset_lmstudio_state):
+    """Test verify returns correct status when model is loaded."""
+    mock_loaded_model = Mock()
+    mock_loaded_model.identifier = "test-model"
+    setup_lmstudio_mock.list_loaded_models.return_value = [mock_loaded_model]
+    
+    model = LMStudioInference(model_name="test-model")
+    result = model.verify()
+    
+    assert result['connected'] is True
+    assert result['model_loaded'] is True
+    assert 'test-model' in result['loaded_models']
+    assert result['error'] is None
+
+
+def test_lmstudio_verify_connected_not_loaded(setup_lmstudio_mock, reset_lmstudio_state):
+    """Test verify returns correct status when model is not loaded."""
+    setup_lmstudio_mock.list_loaded_models.return_value = []
+    
+    model = LMStudioInference(model_name="test-model")
+    result = model.verify()
+    
+    assert result['connected'] is True
+    assert result['model_loaded'] is False
+    assert result['loaded_models'] == []
+    assert "not loaded" in result['error']
+
+
+def test_lmstudio_verify_not_connected(setup_lmstudio_mock, reset_lmstudio_state):
+    """Test verify returns correct status when server becomes unavailable after init."""
+    # Allow initial connection
+    setup_lmstudio_mock.Client.is_valid_api_host.return_value = True
+    
+    model = LMStudioInference(model_name="test-model")
+    
+    # Simulate server becoming unavailable after model creation
+    setup_lmstudio_mock.Client.is_valid_api_host.return_value = False
+    
+    result = model.verify()
+    
+    assert result['connected'] is False
+    assert "Cannot connect" in result['error']
+
+
+def test_lmstudio_ensure_model_loaded_already_loaded(setup_lmstudio_mock, reset_lmstudio_state):
+    """Test ensure_model_loaded returns True quickly when model is already loaded."""
+    mock_loaded_model = Mock()
+    mock_loaded_model.identifier = "test-model"
+    setup_lmstudio_mock.list_loaded_models.return_value = [mock_loaded_model]
+    
+    model = LMStudioInference(model_name="test-model")
+    result = model.ensure_model_loaded(timeout=1)
+    
+    assert result is True
+
+
+def test_lmstudio_clear_model_cache(setup_lmstudio_mock, reset_lmstudio_state):
+    """Test _clear_model_cache clears the cached model instance."""
+    mock_model = Mock()
+    setup_lmstudio_mock.llm.return_value = mock_model
+    
+    model = LMStudioInference(model_name="test-model")
+    model._get_or_load_model()
+    
+    assert model._model_instance is not None
+    model._clear_model_cache()
+    assert model._model_instance is None
+
+
+def test_lmstudio_get_or_load_model_force_reload(setup_lmstudio_mock, reset_lmstudio_state):
+    """Test _get_or_load_model with force_reload clears cache."""
+    mock_model_1 = Mock()
+    mock_model_2 = Mock()
+    setup_lmstudio_mock.llm.side_effect = [mock_model_1, mock_model_2]
+    
+    model = LMStudioInference(model_name="test-model")
+    
+    # First load
+    result1 = model._get_or_load_model()
+    assert result1 == mock_model_1
+    
+    # Force reload should get new model
+    result2 = model._get_or_load_model(force_reload=True)
+    assert result2 == mock_model_2
+
+
+# =============================================================================
+# Model Not Found Retry Tests
+# =============================================================================
+
+def test_lmstudio_invoke_model_not_found_retry(setup_lmstudio_mock, sample_messages, sample_system_prompt, reset_lmstudio_state):
+    """Test that invoke retries on LMStudioModelNotFoundError."""
+    mock_model = Mock()
+    mock_chat = Mock()
+    setup_lmstudio_mock.Chat.return_value = mock_chat
+    
+    # First call raises model not found, second succeeds
+    mock_response = Mock()
+    mock_response.content = "Success after retry"
+    
+    # Create a custom exception class that mimics LMStudioModelNotFoundError
+    class MockLMStudioModelNotFoundError(Exception):
+        pass
+    MockLMStudioModelNotFoundError.__name__ = 'LMStudioModelNotFoundError'
+    
+    mock_model.respond.side_effect = [
+        MockLMStudioModelNotFoundError("No model found"),
+        mock_response
+    ]
+    
+    # Mock list_loaded_models to return the model on second check
+    mock_loaded_model = Mock()
+    mock_loaded_model.identifier = "test-model"
+    setup_lmstudio_mock.list_loaded_models.side_effect = [
+        [],  # First check: not loaded
+        [mock_loaded_model],  # Second check: loaded
+    ]
+    setup_lmstudio_mock.llm.return_value = mock_model
+    
+    model = LMStudioInference(model_name="test-model")
+    
+    # Use short wait times for test
+    response = model.invoke(
+        sample_messages,
+        sample_system_prompt,
+        _model_reload_retries=2,
+        _model_reload_wait_seconds=[0.1, 0.1]
+    )
+    
+    assert response == "Success after retry"
+    assert mock_model.respond.call_count == 2
+
+
+def test_lmstudio_invoke_model_not_found_max_retries(setup_lmstudio_mock, sample_messages, sample_system_prompt, reset_lmstudio_state):
+    """Test that invoke fails after max retries on persistent model not found."""
+    mock_model = Mock()
+    mock_chat = Mock()
+    setup_lmstudio_mock.Chat.return_value = mock_chat
+    
+    # Create exception that matches error detection pattern
+    class MockLMStudioModelNotFoundError(Exception):
+        pass
+    MockLMStudioModelNotFoundError.__name__ = 'LMStudioModelNotFoundError'
+    
+    mock_model.respond.side_effect = MockLMStudioModelNotFoundError("No model found")
+    
+    # Model never becomes available
+    setup_lmstudio_mock.list_loaded_models.return_value = []
+    setup_lmstudio_mock.llm.return_value = mock_model
+    
+    model = LMStudioInference(model_name="test-model")
+    
+    with pytest.raises(RuntimeError, match="Error during LM Studio inference"):
+        model.invoke(
+            sample_messages,
+            sample_system_prompt,
+            _model_reload_retries=2,
+            _model_reload_wait_seconds=[0.1, 0.1]
+        )
+
+
+def test_lmstudio_invoke_non_model_error_no_retry(setup_lmstudio_mock, sample_messages, sample_system_prompt, reset_lmstudio_state):
+    """Test that non-model errors don't trigger retry logic."""
+    mock_model = Mock()
+    mock_chat = Mock()
+    setup_lmstudio_mock.Chat.return_value = mock_chat
+    
+    # Error that is NOT a model-not-found error
+    mock_model.respond.side_effect = ValueError("Some other error")
+    setup_lmstudio_mock.llm.return_value = mock_model
+    
+    model = LMStudioInference(model_name="test-model")
+    
+    with pytest.raises(RuntimeError, match="Error during LM Studio inference"):
+        model.invoke(
+            sample_messages,
+            sample_system_prompt,
+            _model_reload_retries=3,
+            _model_reload_wait_seconds=[0.1, 0.1, 0.1]
+        )
+    
+    # Should only try once (no retries for non-model errors)
+    assert mock_model.respond.call_count == 1
+
+
+def test_lmstudio_invoke_model_crashed_retry(setup_lmstudio_mock, sample_messages, sample_system_prompt, reset_lmstudio_state):
+    """Test that invoke retries on model crashed error."""
+    mock_model = Mock()
+    mock_chat = Mock()
+    setup_lmstudio_mock.Chat.return_value = mock_chat
+    
+    mock_response = Mock()
+    mock_response.content = "Success"
+    
+    # First call raises model crashed, second succeeds
+    mock_model.respond.side_effect = [
+        Exception("The model has crashed without additional information"),
+        mock_response
+    ]
+    
+    mock_loaded_model = Mock()
+    mock_loaded_model.identifier = "test-model"
+    setup_lmstudio_mock.list_loaded_models.return_value = [mock_loaded_model]
+    setup_lmstudio_mock.llm.return_value = mock_model
+    
+    model = LMStudioInference(model_name="test-model")
+    
+    response = model.invoke(
+        sample_messages,
+        sample_system_prompt,
+        _model_reload_retries=2,
+        _model_reload_wait_seconds=[0.1, 0.1]
+    )
+    
+    assert response == "Success"
+    assert mock_model.respond.call_count == 2

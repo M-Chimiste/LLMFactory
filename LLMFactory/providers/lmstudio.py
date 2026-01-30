@@ -18,6 +18,7 @@ import json
 import logging
 import os
 import threading
+import time
 import warnings
 from typing import List, Dict, Union, Optional, Iterator
 
@@ -32,6 +33,11 @@ logger = logging.getLogger(__name__)
 # The SDK only allows configure_default_client() to be called once per process.
 _lmstudio_configured_host: Optional[str] = None
 _host_lock = threading.Lock()
+
+
+# Default retry configuration for model reload
+DEFAULT_MODEL_RELOAD_RETRIES = 3
+DEFAULT_MODEL_RELOAD_WAIT_SECONDS = [5, 10, 15]  # Exponential backoff
 
 
 def _get_configured_host() -> Optional[str]:
@@ -138,8 +144,47 @@ class LMStudioInference(InferenceModel):
         
         return lms
 
-    def _get_or_load_model(self):
-        """Get the model instance, loading it with config if not already loaded."""
+    def is_model_loaded(self) -> bool:
+        """
+        Check if the model is actually loaded in LM Studio.
+        
+        This queries the server to verify the model is in memory,
+        not just that we have a cached handle.
+        
+        Returns:
+            bool: True if the model is currently loaded, False otherwise
+        """
+        if self._lms_module is None:
+            return False
+        
+        try:
+            loaded_models = self._lms_module.list_loaded_models("llm")
+            # Check if our model is in the loaded models list
+            for model in loaded_models:
+                # Model handles have an 'identifier' or we can check string representation
+                model_id = getattr(model, 'identifier', None) or str(model)
+                if self.model_name in model_id:
+                    return True
+            return False
+        except Exception as e:
+            logger.warning(f"Failed to check loaded models: {e}")
+            return False
+
+    def _clear_model_cache(self):
+        """Clear the cached model instance, forcing a fresh load on next use."""
+        self._model_instance = None
+        logger.debug(f"Cleared cached model instance for {self.model_name}")
+
+    def _get_or_load_model(self, force_reload: bool = False):
+        """
+        Get the model instance, loading it with config if not already loaded.
+        
+        Args:
+            force_reload: If True, clears any cached instance and loads fresh
+        """
+        if force_reload:
+            self._clear_model_cache()
+        
         if self._model_instance is not None:
             return self._model_instance
 
@@ -161,8 +206,34 @@ class LMStudioInference(InferenceModel):
             self._model_instance = self.client.llm(self.model_name, config=config)
         else:
             self._model_instance = self.client.llm(self.model_name)
-
+        
+        logger.debug(f"Loaded model instance for {self.model_name}")
         return self._model_instance
+
+    def wait_for_model(
+        self,
+        timeout_seconds: float = 30,
+        poll_interval: float = 2.0
+    ) -> bool:
+        """
+        Wait for the model to be loaded in LM Studio.
+        
+        Useful when LM Studio has auto-reload enabled and the model may
+        take time to load after a crash or unload.
+        
+        Args:
+            timeout_seconds: Maximum time to wait for model to load
+            poll_interval: Time between status checks
+            
+        Returns:
+            bool: True if model became available, False if timeout reached
+        """
+        start_time = time.time()
+        while time.time() - start_time < timeout_seconds:
+            if self.is_model_loaded():
+                return True
+            time.sleep(poll_interval)
+        return False
 
     def _format_messages_for_rest(self, messages: List[Dict[str, str]], system_prompt: str) -> str:
         """Format messages into a single input string for the REST API."""
@@ -438,54 +509,208 @@ class LMStudioInference(InferenceModel):
         if "stop" in kwargs:
             config["stop"] = kwargs["stop"]
 
-        try:
-            if streaming:
-                # Return streaming iterator
-                stream = model.respond_stream(chat, config=config)
+        # Retry logic for model-not-found errors (model may have crashed/unloaded)
+        max_retries = kwargs.get('_model_reload_retries', DEFAULT_MODEL_RELOAD_RETRIES)
+        wait_times = kwargs.get('_model_reload_wait_seconds', DEFAULT_MODEL_RELOAD_WAIT_SECONDS)
+        
+        last_error = None
+        for attempt in range(max_retries):
+            try:
+                if streaming:
+                    # Return streaming iterator
+                    stream = model.respond_stream(chat, config=config)
 
-                def _gen() -> Iterator[str]:
-                    for chunk in stream:
-                        # Handle different possible response formats
-                        if hasattr(chunk, 'content') and chunk.content:
-                            yield chunk.content
-                        elif isinstance(chunk, dict) and 'content' in chunk:
-                            if chunk['content']:
-                                yield chunk['content']
-                        elif isinstance(chunk, str) and chunk:
-                            yield chunk
-                    
-                    # For structured output with streaming, get final parsed result
-                    if schema:
-                        try:
-                            final_result = stream.result()
-                            if hasattr(final_result, 'parsed'):
-                                # Store parsed result for access after iteration
-                                _gen.parsed_result = final_result.parsed
-                        except Exception:
-                            pass
+                    def _gen() -> Iterator[str]:
+                        for chunk in stream:
+                            # Handle different possible response formats
+                            if hasattr(chunk, 'content') and chunk.content:
+                                yield chunk.content
+                            elif isinstance(chunk, dict) and 'content' in chunk:
+                                if chunk['content']:
+                                    yield chunk['content']
+                            elif isinstance(chunk, str) and chunk:
+                                yield chunk
+                        
+                        # For structured output with streaming, get final parsed result
+                        if schema:
+                            try:
+                                final_result = stream.result()
+                                if hasattr(final_result, 'parsed'):
+                                    # Store parsed result for access after iteration
+                                    _gen.parsed_result = final_result.parsed
+                            except Exception:
+                                pass
 
-                return _gen()
-            else:
-                # Return full response
-                response = model.respond(chat, config=config)
-
-                # For structured output, return parsed result
-                if schema and hasattr(response, 'parsed'):
-                    return response.parsed
-                
-                # Handle different possible response formats
-                if hasattr(response, 'content'):
-                    return response.content
-                elif isinstance(response, dict) and 'content' in response:
-                    return response['content']
+                    return _gen()
                 else:
-                    return str(response)
+                    # Return full response
+                    response = model.respond(chat, config=config)
 
+                    # For structured output, return parsed result
+                    if schema and hasattr(response, 'parsed'):
+                        return response.parsed
+                    
+                    # Handle different possible response formats
+                    if hasattr(response, 'content'):
+                        return response.content
+                    elif isinstance(response, dict) and 'content' in response:
+                        return response['content']
+                    else:
+                        return str(response)
+
+            except Exception as e:
+                error_str = str(e).lower()
+                last_error = e
+                
+                # Check if this is a model-not-found or model-crashed error
+                is_model_error = (
+                    'LMStudioModelNotFoundError' in type(e).__name__ or
+                    'no model found' in error_str or
+                    'nomodelmatchingquery' in error_str or
+                    'model has crashed' in error_str or
+                    'totalloadedmodels' in error_str and '0' in error_str
+                )
+                
+                if is_model_error and attempt < max_retries - 1:
+                    # Clear stale model handle
+                    self._clear_model_cache()
+                    
+                    # Wait for potential auto-reload
+                    wait_time = wait_times[min(attempt, len(wait_times) - 1)]
+                    logger.warning(
+                        f"Model '{self.model_name}' appears unloaded (attempt {attempt + 1}/{max_retries}). "
+                        f"Waiting {wait_time}s for potential reload..."
+                    )
+                    time.sleep(wait_time)
+                    
+                    # Verify model is loaded before retrying
+                    if not self.is_model_loaded():
+                        logger.warning(f"Model '{self.model_name}' still not loaded after waiting")
+                        # Try to trigger a fresh load
+                        try:
+                            model = self._get_or_load_model(force_reload=True)
+                        except Exception as load_err:
+                            logger.warning(f"Failed to reload model: {load_err}")
+                            continue
+                    else:
+                        logger.info(f"Model '{self.model_name}' is now loaded, retrying...")
+                        model = self._get_or_load_model(force_reload=True)
+                    
+                    continue
+                else:
+                    # Non-recoverable error or max retries exceeded
+                    break
+        
+        # If we get here, all retries failed
+        raise RuntimeError(
+            f"Error during LM Studio inference: {str(last_error)}. "
+            f"Check that model '{self.model_name}' is available and context length is appropriate."
+        ) from last_error
+
+    def verify(self, wait_for_load: bool = False, timeout: float = 30) -> dict:
+        """
+        Verify connection to LM Studio and check model load status.
+        
+        Unlike _load_model() which only checks connectivity, this method
+        also verifies whether the specified model is actually loaded in memory.
+        
+        Args:
+            wait_for_load: If True, wait for model to become available
+            timeout: Timeout in seconds if wait_for_load is True
+            
+        Returns:
+            dict: Status information including:
+                - connected (bool): Whether LM Studio server is reachable
+                - model_loaded (bool): Whether the specified model is loaded
+                - loaded_models (list): List of currently loaded model identifiers
+                - error (str|None): Error message if verification failed
+        """
+        result = {
+            'connected': False,
+            'model_loaded': False,
+            'loaded_models': [],
+            'error': None
+        }
+        
+        try:
+            # Check connectivity
+            if self._lms_module is None:
+                self._load_model()
+            
+            if not self._lms_module.Client.is_valid_api_host(self.host):
+                result['error'] = f"Cannot connect to LM Studio at {self.host}"
+                return result
+            
+            result['connected'] = True
+            
+            # Get loaded models
+            try:
+                loaded_models = self._lms_module.list_loaded_models("llm")
+                result['loaded_models'] = [
+                    getattr(m, 'identifier', str(m)) for m in loaded_models
+                ]
+            except Exception as e:
+                result['error'] = f"Failed to list loaded models: {e}"
+                return result
+            
+            # Check if our model is loaded
+            model_loaded = self.is_model_loaded()
+            
+            if not model_loaded and wait_for_load:
+                logger.info(f"Waiting up to {timeout}s for model '{self.model_name}' to load...")
+                model_loaded = self.wait_for_model(timeout_seconds=timeout)
+                if model_loaded:
+                    # Refresh loaded models list
+                    loaded_models = self._lms_module.list_loaded_models("llm")
+                    result['loaded_models'] = [
+                        getattr(m, 'identifier', str(m)) for m in loaded_models
+                    ]
+            
+            result['model_loaded'] = model_loaded
+            
+            if not model_loaded:
+                result['error'] = (
+                    f"Model '{self.model_name}' is not loaded. "
+                    f"Loaded models: {result['loaded_models'] or 'none'}"
+                )
+            
+            return result
+            
         except Exception as e:
-            raise RuntimeError(
-                f"Error during LM Studio inference: {str(e)}. "
-                f"Check that model '{self.model_name}' is available and context length is appropriate."
-            ) from e
+            result['error'] = str(e)
+            return result
+
+    def ensure_model_loaded(self, timeout: float = 60) -> bool:
+        """
+        Ensure the model is loaded and ready for inference.
+        
+        This is a convenience method that:
+        1. Checks if model is currently loaded
+        2. If not, waits for auto-reload (if LM Studio has it enabled)
+        3. Clears any stale cached handles
+        4. Returns whether the model is ready
+        
+        Args:
+            timeout: Maximum time to wait for model to become available
+            
+        Returns:
+            bool: True if model is loaded and ready, False otherwise
+        """
+        # First check current status
+        if self.is_model_loaded():
+            return True
+        
+        # Clear any stale handle
+        self._clear_model_cache()
+        
+        # Wait for model to become available
+        logger.info(f"Model '{self.model_name}' not loaded, waiting up to {timeout}s...")
+        if self.wait_for_model(timeout_seconds=timeout):
+            logger.info(f"Model '{self.model_name}' is now loaded")
+            return True
+        
+        logger.warning(f"Model '{self.model_name}' did not load within {timeout}s")
+        return False
 
     def unload_model(self):
         """Unload the model from memory to free resources."""
