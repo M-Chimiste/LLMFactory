@@ -10,7 +10,6 @@ torch
 torchvision
 torchaudio
 llama-cpp-python
-lmstudio
 Pillow
 python-dotenv
 pytest

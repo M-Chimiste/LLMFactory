@@ -12,53 +12,41 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""LM Studio inference provider."""
+"""LM Studio inference provider using OpenAI-compatible API.
+
+This provider uses the OpenAI Python SDK to communicate with LM Studio's
+OpenAI-compatible endpoints, providing a more stable and well-tested
+integration than the native lmstudio-python SDK.
+"""
 
 import json
 import logging
 import os
-import threading
 import time
-import warnings
 from typing import List, Dict, Union, Optional, Iterator
 
 import requests
+from openai import OpenAI
 from pydantic import BaseModel
 
 from .base import InferenceModel, _encode_image, ThinkingResponse
 
 logger = logging.getLogger(__name__)
 
-# Module-level state for handling LMStudio SDK's singleton pattern.
-# The SDK only allows configure_default_client() to be called once per process.
-_lmstudio_configured_host: Optional[str] = None
-_host_lock = threading.Lock()
-
-
 # Default retry configuration for model reload
 DEFAULT_MODEL_RELOAD_RETRIES = 3
 DEFAULT_MODEL_RELOAD_WAIT_SECONDS = [5, 10, 15]  # Exponential backoff
 
 
-def _get_configured_host() -> Optional[str]:
-    """Return the currently configured LMStudio host, or None if not yet configured."""
-    return _lmstudio_configured_host
-
-
-def _reset_configured_host() -> None:
-    """
-    Reset the configured host tracking (for testing purposes only).
-    
-    WARNING: This does NOT reset the actual LMStudio SDK state.
-    The SDK's default client cannot be reconfigured without restarting the process.
-    """
-    global _lmstudio_configured_host
-    with _host_lock:
-        _lmstudio_configured_host = None
-
-
 class LMStudioInference(InferenceModel):
-    """LM Studio Inference using the lmstudio-python SDK with support for remote connections and context configuration."""
+    """LM Studio Inference using OpenAI-compatible API.
+    
+    This provider uses the OpenAI Python SDK to communicate with LM Studio,
+    providing better stability than the native lmstudio-python SDK.
+    Model management (load/unload/status) uses direct HTTP calls to 
+    LM Studio's REST API.
+    """
+    
     def __init__(self,
                  model_name: str,
                  max_new_tokens: int = 4096,
@@ -66,7 +54,9 @@ class LMStudioInference(InferenceModel):
                  host: Optional[str] = None,
                  context_length: Optional[int] = None,
                  gpu_offload: Optional[Union[str, float]] = None,
-                 trust_remote_code: bool = True):
+                 flash_attention: Optional[bool] = None,
+                 trust_remote_code: bool = True,
+                 api_key: str = "lm-studio"):
         """
         Initialize LM Studio inference client.
 
@@ -74,159 +64,205 @@ class LMStudioInference(InferenceModel):
             model_name (str): The model identifier (e.g., "qwen2.5-7b-instruct")
             max_new_tokens (int): Maximum tokens to generate
             temperature (float): Sampling temperature
-            host (Optional[str]): Remote host (e.g., "athena.local:1234" or "192.168.1.100:1234").
-                                 If None, uses localhost. Can also be set via LMSTUDIO_HOST env var.
+            host (Optional[str]): Host address (e.g., "localhost:1234" or "athena.local:1234").
+                                 If None, uses localhost:1234. Can also be set via LMSTUDIO_HOST env var.
             context_length (Optional[int]): Context window size to load model with.
-                                           If None, uses model default (often 4096).
-                                           Set this to use full model capacity (e.g., 32768, 131072)
-            gpu_offload (Optional[Union[str, float]]): GPU offload ratio.
-                                                       Can be "max" (all layers), "off" (CPU only),
-                                                       or float 0-1 (proportion of layers)
+                                           Used when auto-loading models via API.
+            gpu_offload (Optional[Union[str, float]]): GPU offload setting for model loading.
+            flash_attention (Optional[bool]): Enable flash attention when loading model.
             trust_remote_code (bool): Compatibility parameter (unused for LM Studio)
+            api_key (str): API key for LM Studio (default "lm-studio", usually not needed)
 
         Examples:
-            # Local with large context
-            llm = LMStudioInference("qwen2.5-7b-instruct", context_length=32768)
+            # Basic usage
+            llm = LMStudioInference("qwen2.5-7b-instruct")
 
-            # Remote with full GPU offload
-            llm = LMStudioInference("llama-3.1-8b", host="athena.local:1234", gpu_offload="max")
+            # Remote server
+            llm = LMStudioInference("llama-3.1-8b", host="athena.local:1234")
 
-            # Local with specific GPU ratio
-            llm = LMStudioInference("mistral-7b", gpu_offload=0.5, context_length=16384)
+            # With specific context length for loading
+            llm = LMStudioInference("mistral-7b", context_length=32768)
         """
         self.host = host or os.environ.get("LMSTUDIO_HOST", "localhost:1234")
         self.context_length = context_length
         self.gpu_offload = gpu_offload
-        self._model_instance = None  # Will hold the actual loaded model
-        self._lms_module = None  # Will hold the lmstudio module
+        self.flash_attention = flash_attention
+        self.api_key = api_key
+        
+        # Ensure host has protocol
+        if not self.host.startswith("http"):
+            self.base_url = f"http://{self.host}"
+        else:
+            self.base_url = self.host
+            # Strip protocol for self.host to keep just host:port
+            self.host = self.host.replace("http://", "").replace("https://", "")
+        
         super().__init__(model_name, max_new_tokens, temperature, trust_remote_code)
 
     def _get_provider(self) -> str:
         return "lmstudio"
 
     def _load_model(self):
-        """Initialize the LM Studio client with singleton-aware configuration."""
-        global _lmstudio_configured_host
-        
+        """Initialize the OpenAI client pointing to LM Studio."""
+        # Verify connectivity
         try:
-            import lmstudio as lms
-            self._lms_module = lms
-        except ImportError:
-            raise ImportError(
-                "lmstudio-python is not installed. Install it with: pip install lmstudio"
-            )
-
-        # Check if remote host is reachable
-        if not lms.Client.is_valid_api_host(self.host):
+            response = requests.get(f"{self.base_url}/v1/models", timeout=5)
+            response.raise_for_status()
+        except requests.RequestException as e:
             raise ConnectionError(
-                f"Cannot connect to LM Studio at {self.host}. "
-                "Ensure LM Studio is running and network access is enabled if remote."
+                f"Cannot connect to LM Studio at {self.base_url}. "
+                f"Ensure LM Studio is running and the server is enabled. Error: {e}"
             )
-
-        # Handle the SDK's singleton pattern - only configure once per process
-        with _host_lock:
-            if _lmstudio_configured_host is None:
-                # First configuration - set the default client
-                lms.configure_default_client(self.host)
-                _lmstudio_configured_host = self.host
-                logger.info(f"Configured LMStudio default client for host: {self.host}")
-            elif _lmstudio_configured_host != self.host:
-                # Different host requested - this is an SDK limitation
-                warnings.warn(
-                    f"LMStudio SDK limitation: Cannot change host from "
-                    f"'{_lmstudio_configured_host}' to '{self.host}'. "
-                    f"Using previously configured host. Restart Python process to change hosts.",
-                    UserWarning
-                )
-                # Update self.host to match the actual configured host
-                self.host = _lmstudio_configured_host
-            # else: same host, already configured - nothing to do
         
-        return lms
+        return OpenAI(base_url=f"{self.base_url}/v1", api_key=self.api_key)
+
+    def _get_native_api_url(self, endpoint: str) -> str:
+        """Get the full URL for native LM Studio API endpoints."""
+        return f"{self.base_url}/api/v1{endpoint}"
 
     def is_model_loaded(self) -> bool:
         """
-        Check if the model is actually loaded in LM Studio.
-        
-        This queries the server to verify the model is in memory,
-        not just that we have a cached handle.
+        Check if the model is currently loaded in LM Studio.
         
         Returns:
-            bool: True if the model is currently loaded, False otherwise
+            bool: True if the model is loaded, False otherwise
         """
-        if self._lms_module is None:
-            return False
-        
         try:
-            loaded_models = self._lms_module.list_loaded_models("llm")
-            # Check if our model is in the loaded models list
-            for model in loaded_models:
-                # Model handles have an 'identifier' or we can check string representation
-                model_id = getattr(model, 'identifier', None) or str(model)
-                if self.model_name in model_id:
+            response = requests.get(
+                self._get_native_api_url("/models"),
+                timeout=10
+            )
+            response.raise_for_status()
+            data = response.json()
+            
+            for model in data.get("models", []):
+                model_key = model.get("key", "")
+                loaded_instances = model.get("loaded_instances", [])
+                
+                # Check if our model matches and has loaded instances
+                if self.model_name in model_key and len(loaded_instances) > 0:
                     return True
+                    
+                # Also check instance IDs directly
+                for instance in loaded_instances:
+                    if self.model_name in instance.get("id", ""):
+                        return True
+            
             return False
         except Exception as e:
-            logger.warning(f"Failed to check loaded models: {e}")
+            logger.warning(f"Failed to check model load status: {e}")
             return False
 
-    def _clear_model_cache(self):
-        """Clear the cached model instance, forcing a fresh load on next use."""
-        self._model_instance = None
-        logger.debug(f"Cleared cached model instance for {self.model_name}")
-
-    def _get_or_load_model(self, force_reload: bool = False):
+    def get_loaded_models(self) -> List[Dict]:
         """
-        Get the model instance, loading it with config if not already loaded.
+        Get list of currently loaded models with their configurations.
+        
+        Returns:
+            List[Dict]: List of loaded model info dictionaries
+        """
+        try:
+            response = requests.get(
+                self._get_native_api_url("/models"),
+                timeout=10
+            )
+            response.raise_for_status()
+            data = response.json()
+            
+            loaded = []
+            for model in data.get("models", []):
+                instances = model.get("loaded_instances", [])
+                if instances:
+                    loaded.append({
+                        "key": model.get("key"),
+                        "display_name": model.get("display_name"),
+                        "type": model.get("type"),
+                        "instances": instances
+                    })
+            return loaded
+        except Exception as e:
+            logger.warning(f"Failed to get loaded models: {e}")
+            return []
+
+    def load_model_explicit(
+        self,
+        context_length: Optional[int] = None,
+        flash_attention: Optional[bool] = None,
+        timeout: float = 120
+    ) -> bool:
+        """
+        Explicitly load the model into LM Studio memory.
         
         Args:
-            force_reload: If True, clears any cached instance and loads fresh
+            context_length: Context length to use (overrides instance setting)
+            flash_attention: Enable flash attention (overrides instance setting)
+            timeout: Maximum time to wait for model to load
+            
+        Returns:
+            bool: True if model loaded successfully
         """
-        if force_reload:
-            self._clear_model_cache()
+        payload = {"model": self.model_name}
         
-        if self._model_instance is not None:
-            return self._model_instance
-
-        # Build load configuration
-        # Note: LM Studio SDK uses camelCase parameter names
-        config = {}
-        if self.context_length is not None:
-            config["contextLength"] = self.context_length
-        if self.gpu_offload is not None:
-            if isinstance(self.gpu_offload, str):
-                # For string values like "max" or "off", use gpuOffload
-                config["gpuOffload"] = self.gpu_offload
-            else:
-                # For numeric ratio (0-1), use gpu.ratio structure
-                config["gpu"] = {"ratio": self.gpu_offload}
-
-        # Load model with configuration (JIT loading)
-        if config:
-            self._model_instance = self.client.llm(self.model_name, config=config)
-        else:
-            self._model_instance = self.client.llm(self.model_name)
+        ctx_len = context_length or self.context_length
+        if ctx_len:
+            payload["context_length"] = ctx_len
         
-        logger.debug(f"Loaded model instance for {self.model_name}")
-        return self._model_instance
+        flash = flash_attention if flash_attention is not None else self.flash_attention
+        if flash is not None:
+            payload["flash_attention"] = flash
+            
+        try:
+            response = requests.post(
+                self._get_native_api_url("/models/load"),
+                json=payload,
+                timeout=timeout
+            )
+            response.raise_for_status()
+            result = response.json()
+            logger.info(
+                f"Model {self.model_name} loaded in {result.get('load_time_seconds', '?')}s"
+            )
+            return True
+        except requests.Timeout:
+            logger.error(f"Timeout loading model {self.model_name}")
+            return False
+        except Exception as e:
+            logger.error(f"Failed to load model {self.model_name}: {e}")
+            return False
+
+    def unload_model(self) -> bool:
+        """
+        Unload the model from LM Studio memory.
+        
+        Returns:
+            bool: True if model unloaded successfully
+        """
+        try:
+            response = requests.post(
+                self._get_native_api_url("/models/unload"),
+                json={"model": self.model_name},
+                timeout=30
+            )
+            response.raise_for_status()
+            logger.info(f"Model {self.model_name} unloaded")
+            return True
+        except Exception as e:
+            logger.warning(f"Failed to unload model {self.model_name}: {e}")
+            return False
 
     def wait_for_model(
         self,
-        timeout_seconds: float = 30,
+        timeout_seconds: float = 60,
         poll_interval: float = 2.0
     ) -> bool:
         """
         Wait for the model to be loaded in LM Studio.
         
-        Useful when LM Studio has auto-reload enabled and the model may
-        take time to load after a crash or unload.
-        
         Args:
-            timeout_seconds: Maximum time to wait for model to load
+            timeout_seconds: Maximum time to wait
             poll_interval: Time between status checks
             
         Returns:
-            bool: True if model became available, False if timeout reached
+            bool: True if model became available, False if timeout
         """
         start_time = time.time()
         while time.time() - start_time < timeout_seconds:
@@ -235,15 +271,98 @@ class LMStudioInference(InferenceModel):
             time.sleep(poll_interval)
         return False
 
-    def _format_messages_for_rest(self, messages: List[Dict[str, str]], system_prompt: str) -> str:
-        """Format messages into a single input string for the REST API."""
+    def ensure_model_loaded(self, timeout: float = 120) -> bool:
+        """
+        Ensure the model is loaded, loading it if necessary.
+        
+        Args:
+            timeout: Maximum time to wait for loading
+            
+        Returns:
+            bool: True if model is ready for inference
+        """
+        if self.is_model_loaded():
+            return True
+        
+        logger.info(f"Model {self.model_name} not loaded, attempting to load...")
+        
+        # Try to load the model
+        if self.load_model_explicit(timeout=timeout):
+            return True
+        
+        # If explicit load failed, wait in case LM Studio is auto-loading
+        logger.info(f"Waiting for model {self.model_name} to become available...")
+        return self.wait_for_model(timeout_seconds=timeout)
+
+    def verify(self, wait_for_load: bool = False, timeout: float = 30) -> dict:
+        """
+        Verify connection to LM Studio and check model status.
+        
+        Args:
+            wait_for_load: If True, wait for model to become available
+            timeout: Timeout in seconds if wait_for_load is True
+            
+        Returns:
+            dict: Status information including:
+                - connected (bool): Whether LM Studio is reachable
+                - model_loaded (bool): Whether the model is loaded
+                - loaded_models (list): List of currently loaded models
+                - error (str|None): Error message if any
+        """
+        result = {
+            'connected': False,
+            'model_loaded': False,
+            'loaded_models': [],
+            'error': None
+        }
+        
+        try:
+            # Check connectivity
+            response = requests.get(f"{self.base_url}/v1/models", timeout=5)
+            response.raise_for_status()
+            result['connected'] = True
+            
+            # Get loaded models
+            loaded = self.get_loaded_models()
+            result['loaded_models'] = [m.get('key') for m in loaded]
+            
+            # Check if our model is loaded
+            model_loaded = self.is_model_loaded()
+            
+            if not model_loaded and wait_for_load:
+                logger.info(f"Waiting for model '{self.model_name}' to load...")
+                model_loaded = self.wait_for_model(timeout_seconds=timeout)
+                if model_loaded:
+                    loaded = self.get_loaded_models()
+                    result['loaded_models'] = [m.get('key') for m in loaded]
+            
+            result['model_loaded'] = model_loaded
+            
+            if not model_loaded:
+                result['error'] = (
+                    f"Model '{self.model_name}' is not loaded. "
+                    f"Loaded models: {result['loaded_models'] or 'none'}"
+                )
+            
+            return result
+            
+        except Exception as e:
+            result['error'] = str(e)
+            return result
+
+    def _format_messages_for_responses(
+        self, 
+        messages: List[Dict[str, str]], 
+        system_prompt: str
+    ) -> str:
+        """Format messages for the /v1/responses endpoint."""
         parts = []
         if system_prompt:
             parts.append(f"System: {system_prompt}")
         for msg in messages:
             role = msg.get("role", "user").capitalize()
             content = msg.get("content", "")
-            if role.lower() != "system":  # Skip system messages, already added
+            if role.lower() != "system":
                 parts.append(f"{role}: {content}")
         return "\n\n".join(parts)
 
@@ -259,27 +378,17 @@ class LMStudioInference(InferenceModel):
         **kwargs
     ) -> Union[str, ThinkingResponse, Iterator[str]]:
         """
-        Invoke LM Studio with thinking/reasoning mode using the /v1/responses REST endpoint.
-        
-        This method bypasses the SDK to use the REST API which supports reasoning parameters.
+        Invoke with thinking/reasoning mode using /v1/responses endpoint.
         """
         # Determine effort level
         if isinstance(use_thinking, str):
             effort = use_thinking
         else:
-            effort = "medium"  # Default effort level
+            effort = "medium"
         
-        # Build the REST API URL
-        # Handle host format (may or may not include protocol)
-        host = self.host
-        if not host.startswith("http"):
-            host = f"http://{host}"
-        url = f"{host}/v1/responses"
+        url = f"{self.base_url}/v1/responses"
+        input_text = self._format_messages_for_responses(messages, system_prompt)
         
-        # Format the input
-        input_text = self._format_messages_for_rest(messages, system_prompt)
-        
-        # Build request payload
         payload = {
             "model": model_name or self.model_name,
             "input": input_text,
@@ -295,8 +404,6 @@ class LMStudioInference(InferenceModel):
                 try:
                     with requests.post(url, json=payload, stream=True, timeout=300) as resp:
                         resp.raise_for_status()
-                        thinking_parts = []
-                        content_parts = []
                         
                         for line in resp.iter_lines():
                             if not line:
@@ -308,7 +415,6 @@ class LMStudioInference(InferenceModel):
                                     break
                                 try:
                                     data = json.loads(data_str)
-                                    # Handle SSE events from /v1/responses
                                     if 'output' in data:
                                         for item in data.get('output', []):
                                             item_type = item.get('type', '')
@@ -323,17 +429,15 @@ class LMStudioInference(InferenceModel):
                                 except json.JSONDecodeError:
                                     continue
                 except requests.RequestException as e:
-                    raise RuntimeError(f"Error during LM Studio REST API call: {e}") from e
+                    raise RuntimeError(f"Error during LM Studio thinking API call: {e}") from e
             
             return _gen_thinking_stream()
         else:
-            # Non-streaming request
             try:
                 response = requests.post(url, json=payload, timeout=300)
                 response.raise_for_status()
                 data = response.json()
                 
-                # Parse the structured response
                 reasoning_text = None
                 content_text = None
                 
@@ -346,7 +450,6 @@ class LMStudioInference(InferenceModel):
                         elif item_type == 'message':
                             content_text = text
                 
-                # Fallback if content not found
                 if content_text is None:
                     content_text = ""
                 
@@ -356,7 +459,7 @@ class LMStudioInference(InferenceModel):
                     return content_text
                     
             except requests.RequestException as e:
-                raise RuntimeError(f"Error during LM Studio REST API call: {e}") from e
+                raise RuntimeError(f"Error during LM Studio thinking API call: {e}") from e
 
     def invoke(self,
                messages: List[Dict[str, str]],
@@ -373,28 +476,24 @@ class LMStudioInference(InferenceModel):
         Invoke the LM Studio model to generate a response.
 
         Args:
-            messages (List[Dict[str, str]]): Conversation history as list of dicts with 'role' and 'content'
+            messages (List[Dict[str, str]]): Conversation history as list of 
+                dicts with 'role' and 'content'
             system_prompt (str): System prompt to guide model behavior
             streaming (bool): Whether to stream the response token by token
-            model_name (Optional[str]): Override model name (loads different model if specified)
+            model_name (Optional[str]): Override model name for this call
             schema (Optional[BaseModel]): Pydantic schema for structured JSON output
-            images (Optional[List[Union[str, bytes]]]): Images for multimodal models (VLMs).
-                                                        Can be file paths or raw bytes.
-            use_thinking (Union[bool, str], optional): Enable thinking/reasoning mode.
+            images (Optional[List[Union[str, bytes]]]): Images for vision models.
+                Can be file paths or raw bytes.
+            use_thinking (Union[bool, str]): Enable thinking/reasoning mode.
                 Can be True (uses "medium" effort), False (disabled), or a string
-                "low"/"medium"/"high" to specify effort level. When enabled, uses
-                the /v1/responses REST endpoint. Defaults to False.
-            return_thinking (bool, optional): If True and use_thinking is enabled,
-                return a ThinkingResponse containing both thinking trace and content.
-                If False, return only the content. Defaults to False.
-            **kwargs: Additional parameters:
-                     - max_tokens: Override max_new_tokens
-                     - temperature: Override temperature
-                     - top_p, top_k, stop: Sampling parameters
+                "low"/"medium"/"high" to specify effort level.
+            return_thinking (bool): If True and use_thinking is enabled,
+                return a ThinkingResponse containing both thinking and content.
+            **kwargs: Additional parameters (max_tokens, temperature, top_p, etc.)
 
         Returns:
-            Union[str, ThinkingResponse, Iterator[str]]: Full response string, ThinkingResponse
-                (if return_thinking=True), or iterator yielding tokens if streaming=True
+            Union[str, ThinkingResponse, Iterator[str]]: Response string,
+                ThinkingResponse (if return_thinking=True), or iterator if streaming
 
         Examples:
             # Simple query
@@ -407,23 +506,6 @@ class LMStudioInference(InferenceModel):
             for token in llm.invoke(messages, system, streaming=True):
                 print(token, end="", flush=True)
 
-            # With thinking/reasoning mode
-            response = llm.invoke(
-                [{"role": "user", "content": "Solve: 15 * 23"}],
-                "You are a math tutor.",
-                use_thinking="high",
-                return_thinking=True
-            )
-            print(f"Thinking: {response.thinking}")
-            print(f"Answer: {response.content}")
-
-            # With images (VLM)
-            response = llm.invoke(
-                [{"role": "user", "content": "What's in this image?"}],
-                "You are a vision assistant.",
-                images=["photo.jpg"]
-            )
-
             # Structured output
             from pydantic import BaseModel
             class Answer(BaseModel):
@@ -431,13 +513,20 @@ class LMStudioInference(InferenceModel):
                 confidence: float
 
             response = llm.invoke(messages, system, schema=Answer)
+
+            # With thinking mode
+            response = llm.invoke(
+                messages, system,
+                use_thinking="high",
+                return_thinking=True
+            )
         """
-        # If thinking mode is enabled, use the REST API endpoint
+        # Use thinking endpoint if requested
         if use_thinking:
             if images:
-                logger.warning("Images are not supported with thinking mode. Ignoring images.")
+                logger.warning("Images not supported with thinking mode. Ignoring.")
             if schema:
-                logger.warning("Schema is not supported with thinking mode. Ignoring schema.")
+                logger.warning("Schema not supported with thinking mode. Ignoring.")
             return self._invoke_with_thinking(
                 messages=messages,
                 system_prompt=system_prompt,
@@ -448,68 +537,60 @@ class LMStudioInference(InferenceModel):
                 **kwargs
             )
         
-        # Standard path using the SDK
-        # Get or load the model
-        model = self._get_or_load_model()
-
-        # Create Chat object with system prompt as constructor argument
-        chat = self.client.Chat(system_prompt)
+        # Build messages with system prompt
+        full_messages = [{"role": "system", "content": system_prompt}] + messages
         
-        # Process messages and handle images
-        image_handles = None
+        # Handle images for vision models
         if images:
-            # Prepare image handles using LM Studio's prepare_image
-            image_handles = []
+            content = []
             for img in images:
-                if isinstance(img, bytes):
-                    # Pass bytes directly
-                    image_handles.append(self.client.prepare_image(img))
-                elif isinstance(img, str):
-                    # Path to image file
-                    image_handles.append(self.client.prepare_image(img))
-                else:
-                    raise ValueError(f"Unsupported image type: {type(img)}. Use str (path) or bytes.")
-
-        # Add conversation history
-        for i, msg in enumerate(messages):
-            role = msg.get("role", "user")
-            content = msg.get("content", "")
-
-            # If this is the last user message and we have images, add them
-            is_last_user_msg = (i == len(messages) - 1 and role == "user")
-
-            if role == "system":
-                # Skip system messages as they're handled in Chat constructor
-                continue
-            elif role == "assistant":
-                chat.add_assistant_message(content)
-            else:  # user or any other role
-                if is_last_user_msg and image_handles:
-                    chat.add_user_message(content, images=image_handles)
-                else:
-                    chat.add_user_message(content)
-
-        # Build generation config
-        # Note: LM Studio SDK uses a 'config' dict with camelCase parameter names
-        config = {
+                encoded = _encode_image(img)
+                content.append({
+                    "type": "image_url",
+                    "image_url": {"url": f"data:image/jpeg;base64,{encoded}"}
+                })
+            content.append({
+                "type": "text",
+                "text": full_messages[-1]["content"]
+            })
+            full_messages[-1] = {
+                "role": full_messages[-1]["role"],
+                "content": content
+            }
+        
+        # Build completion parameters
+        completion_params = {
+            "model": model_name or self.model_name,
+            "messages": full_messages,
+            "max_tokens": kwargs.get("max_tokens", self.max_new_tokens),
             "temperature": kwargs.get("temperature", self.temperature),
-            "maxTokens": kwargs.get("max_tokens", self.max_new_tokens),
         }
         
-        # Add structured output support if schema provided
-        if schema:
-            config["response_format"] = schema
-
-        # Add additional sampling parameters if provided
-        # Map snake_case to camelCase for LM Studio SDK
+        # Add optional parameters
         if "top_p" in kwargs:
-            config["topP"] = kwargs["top_p"]
+            completion_params["top_p"] = kwargs["top_p"]
         if "top_k" in kwargs:
-            config["topK"] = kwargs["top_k"]
+            completion_params["top_k"] = kwargs["top_k"]
         if "stop" in kwargs:
-            config["stop"] = kwargs["stop"]
-
-        # Retry logic for model-not-found errors (model may have crashed/unloaded)
+            completion_params["stop"] = kwargs["stop"]
+        if "presence_penalty" in kwargs:
+            completion_params["presence_penalty"] = kwargs["presence_penalty"]
+        if "frequency_penalty" in kwargs:
+            completion_params["frequency_penalty"] = kwargs["frequency_penalty"]
+        if "seed" in kwargs:
+            completion_params["seed"] = kwargs["seed"]
+        
+        # Add structured output support
+        if schema:
+            completion_params["response_format"] = {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": schema.__name__,
+                    "schema": schema.model_json_schema()
+                }
+            }
+        
+        # Retry logic for model-not-loaded errors
         max_retries = kwargs.get('_model_reload_retries', DEFAULT_MODEL_RELOAD_RETRIES)
         wait_times = kwargs.get('_model_reload_wait_seconds', DEFAULT_MODEL_RELOAD_WAIT_SECONDS)
         
@@ -517,213 +598,59 @@ class LMStudioInference(InferenceModel):
         for attempt in range(max_retries):
             try:
                 if streaming:
-                    # Return streaming iterator
-                    stream = model.respond_stream(chat, config=config)
-
+                    completion_params["stream"] = True
+                    stream = self.client.chat.completions.create(**completion_params)
+                    
                     def _gen() -> Iterator[str]:
                         for chunk in stream:
-                            # Handle different possible response formats
-                            if hasattr(chunk, 'content') and chunk.content:
-                                yield chunk.content
-                            elif isinstance(chunk, dict) and 'content' in chunk:
-                                if chunk['content']:
-                                    yield chunk['content']
-                            elif isinstance(chunk, str) and chunk:
-                                yield chunk
-                        
-                        # For structured output with streaming, get final parsed result
-                        if schema:
-                            try:
-                                final_result = stream.result()
-                                if hasattr(final_result, 'parsed'):
-                                    # Store parsed result for access after iteration
-                                    _gen.parsed_result = final_result.parsed
-                            except Exception:
-                                pass
-
+                            if chunk.choices and chunk.choices[0].delta.content:
+                                yield chunk.choices[0].delta.content
+                    
                     return _gen()
                 else:
-                    # Return full response
-                    response = model.respond(chat, config=config)
-
-                    # For structured output, return parsed result
-                    if schema and hasattr(response, 'parsed'):
-                        return response.parsed
+                    response = self.client.chat.completions.create(**completion_params)
+                    return response.choices[0].message.content
                     
-                    # Handle different possible response formats
-                    if hasattr(response, 'content'):
-                        return response.content
-                    elif isinstance(response, dict) and 'content' in response:
-                        return response['content']
-                    else:
-                        return str(response)
-
             except Exception as e:
                 error_str = str(e).lower()
                 last_error = e
                 
-                # Check if this is a model-not-found or model-crashed error
+                # Check if this is a model-not-loaded error
                 is_model_error = (
-                    'LMStudioModelNotFoundError' in type(e).__name__ or
                     'no model found' in error_str or
+                    'model not found' in error_str or
                     'nomodelmatchingquery' in error_str or
                     'model has crashed' in error_str or
-                    'totalloadedmodels' in error_str and '0' in error_str
+                    ('totalloadedmodels' in error_str and '0' in error_str) or
+                    'could not find' in error_str
                 )
                 
                 if is_model_error and attempt < max_retries - 1:
-                    # Clear stale model handle
-                    self._clear_model_cache()
-                    
-                    # Wait for potential auto-reload
                     wait_time = wait_times[min(attempt, len(wait_times) - 1)]
                     logger.warning(
-                        f"Model '{self.model_name}' appears unloaded (attempt {attempt + 1}/{max_retries}). "
-                        f"Waiting {wait_time}s for potential reload..."
+                        f"Model '{self.model_name}' not available (attempt {attempt + 1}/{max_retries}). "
+                        f"Waiting {wait_time}s..."
                     )
                     time.sleep(wait_time)
                     
-                    # Verify model is loaded before retrying
+                    # Try to ensure model is loaded
                     if not self.is_model_loaded():
-                        logger.warning(f"Model '{self.model_name}' still not loaded after waiting")
-                        # Try to trigger a fresh load
-                        try:
-                            model = self._get_or_load_model(force_reload=True)
-                        except Exception as load_err:
-                            logger.warning(f"Failed to reload model: {load_err}")
-                            continue
-                    else:
-                        logger.info(f"Model '{self.model_name}' is now loaded, retrying...")
-                        model = self._get_or_load_model(force_reload=True)
+                        logger.info(f"Attempting to load model {self.model_name}...")
+                        self.load_model_explicit(timeout=60)
                     
                     continue
                 else:
-                    # Non-recoverable error or max retries exceeded
                     break
         
-        # If we get here, all retries failed
+        # All retries failed
         raise RuntimeError(
-            f"Error during LM Studio inference: {str(last_error)}. "
-            f"Check that model '{self.model_name}' is available and context length is appropriate."
+            f"Error during LM Studio inference: {last_error}. "
+            f"Check that model '{self.model_name}' is available."
         ) from last_error
 
-    def verify(self, wait_for_load: bool = False, timeout: float = 30) -> dict:
-        """
-        Verify connection to LM Studio and check model load status.
-        
-        Unlike _load_model() which only checks connectivity, this method
-        also verifies whether the specified model is actually loaded in memory.
-        
-        Args:
-            wait_for_load: If True, wait for model to become available
-            timeout: Timeout in seconds if wait_for_load is True
-            
-        Returns:
-            dict: Status information including:
-                - connected (bool): Whether LM Studio server is reachable
-                - model_loaded (bool): Whether the specified model is loaded
-                - loaded_models (list): List of currently loaded model identifiers
-                - error (str|None): Error message if verification failed
-        """
-        result = {
-            'connected': False,
-            'model_loaded': False,
-            'loaded_models': [],
-            'error': None
-        }
-        
-        try:
-            # Check connectivity
-            if self._lms_module is None:
-                self._load_model()
-            
-            if not self._lms_module.Client.is_valid_api_host(self.host):
-                result['error'] = f"Cannot connect to LM Studio at {self.host}"
-                return result
-            
-            result['connected'] = True
-            
-            # Get loaded models
-            try:
-                loaded_models = self._lms_module.list_loaded_models("llm")
-                result['loaded_models'] = [
-                    getattr(m, 'identifier', str(m)) for m in loaded_models
-                ]
-            except Exception as e:
-                result['error'] = f"Failed to list loaded models: {e}"
-                return result
-            
-            # Check if our model is loaded
-            model_loaded = self.is_model_loaded()
-            
-            if not model_loaded and wait_for_load:
-                logger.info(f"Waiting up to {timeout}s for model '{self.model_name}' to load...")
-                model_loaded = self.wait_for_model(timeout_seconds=timeout)
-                if model_loaded:
-                    # Refresh loaded models list
-                    loaded_models = self._lms_module.list_loaded_models("llm")
-                    result['loaded_models'] = [
-                        getattr(m, 'identifier', str(m)) for m in loaded_models
-                    ]
-            
-            result['model_loaded'] = model_loaded
-            
-            if not model_loaded:
-                result['error'] = (
-                    f"Model '{self.model_name}' is not loaded. "
-                    f"Loaded models: {result['loaded_models'] or 'none'}"
-                )
-            
-            return result
-            
-        except Exception as e:
-            result['error'] = str(e)
-            return result
-
-    def ensure_model_loaded(self, timeout: float = 60) -> bool:
-        """
-        Ensure the model is loaded and ready for inference.
-        
-        This is a convenience method that:
-        1. Checks if model is currently loaded
-        2. If not, waits for auto-reload (if LM Studio has it enabled)
-        3. Clears any stale cached handles
-        4. Returns whether the model is ready
-        
-        Args:
-            timeout: Maximum time to wait for model to become available
-            
-        Returns:
-            bool: True if model is loaded and ready, False otherwise
-        """
-        # First check current status
-        if self.is_model_loaded():
-            return True
-        
-        # Clear any stale handle
-        self._clear_model_cache()
-        
-        # Wait for model to become available
-        logger.info(f"Model '{self.model_name}' not loaded, waiting up to {timeout}s...")
-        if self.wait_for_model(timeout_seconds=timeout):
-            logger.info(f"Model '{self.model_name}' is now loaded")
-            return True
-        
-        logger.warning(f"Model '{self.model_name}' did not load within {timeout}s")
-        return False
-
-    def unload_model(self):
-        """Unload the model from memory to free resources."""
-        if self._model_instance is not None:
-            try:
-                self._model_instance.unload()
-            except Exception:
-                pass  # Ignore errors during unload
-            self._model_instance = None
-
     def close(self):
-        """Clean up resources."""
-        self.unload_model()
+        """Clean up resources (no-op for HTTP-based client)."""
+        pass
 
     def __del__(self):
         """Ensure cleanup on deletion."""
